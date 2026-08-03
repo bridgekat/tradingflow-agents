@@ -1,0 +1,9 @@
+# Per-run agent workspaces (clones/worktrees of the substrate repo).
+workspace/
+
+# Python environments and caches.
+.venv/
+__pycache__/
+
+# API keys and local configuration.
+.env
