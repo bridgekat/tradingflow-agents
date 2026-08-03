@@ -14,6 +14,7 @@ dependencies = [
     "ripgrep>=14",
     "httpx>=0.27",
     "numpy>=2.5.1",
+    "scipy>=1.18.0",
     "pandas>=3.0.5",
     "pyarrow>=25.0.0",
     "tradingflow",
@@ -30,9 +31,7 @@ packages = ["tradingflow_agents"]
 line-length = 120
 
 [tool.uv.workspace]
-members = [
-    "tradingflow",
-]
+members = ["tradingflow"]
 
 [tool.uv.sources]
 tradingflow = { workspace = true, editable = true }

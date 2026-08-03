@@ -1413,6 +1413,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "python-dotenv" },
     { name = "ripgrep" },
+    { name = "scipy" },
     { name = "tradingflow" },
 ]
 
@@ -1425,6 +1426,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=25.0.0" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "ripgrep", specifier = ">=14" },
+    { name = "scipy", specifier = ">=1.18.0" },
     { name = "tradingflow", editable = "tradingflow" },
 ]
 

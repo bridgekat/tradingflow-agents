@@ -2,9 +2,9 @@
 
 LLM agents for experimenting with trading strategies on [TradingFlow](https://github.com/bridgekat/tradingflow).
 
-```console
-$ git submodule update --init --recursive
-$ uv sync
+```bash
+git submodule update --init --recursive
+uv sync
 ```
 
 Configuration comes from flags or environment (a `.env` in the working
@@ -27,10 +27,10 @@ A simple general-purpose quant research and coding agent built on the
 the DeepSeek API. Run it from the directory you want it to work in (tools
 resolve relative paths against the current working directory):
 
-```console
-$ general-research                                       # interactive REPL
-$ general-research -p "add a --verbose flag to cli.py"   # one-shot task
-$ general-research -y                                    # don't ask before running shell commands
+```bash
+general-research                                       # interactive REPL
+general-research -p "add a --verbose flag to cli.py"   # one-shot task
+general-research -y                                    # don't ask before running shell commands
 ```
 
 In the REPL: `/exit` to leave, `/clear` to reset conversation history.
@@ -44,7 +44,7 @@ An agent is a package under `tradingflow_agents/` with two small modules:
   blocks from `core.instructions`) and picks tools, handing both to
   `core.agent.build_agent`;
 - `cli.py` — the entry point: argument parsing and a one-shot or REPL loop,
-  streaming output through `core.console.run_with_output`.
+  streaming output through `core.bash.run_with_output`.
 
 Register the executable in `pyproject.toml` under `[project.scripts]`.
 

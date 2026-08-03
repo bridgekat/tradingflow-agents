@@ -1,18 +1,4 @@
-"""Incremental (recursive-least-squares) pooled Ridge mean predictor.
-
-Strategy-local, self-contained copy assembled from the `tradingflow` Python
-package (`predictor/mean/_incremental.py`, plus `LinearParams` from
-`predictor/mean/_base.py`). The strategy loads it with
-`py_operator_module("ridge_incr", params)`; edit freely — the next run picks
-the change up with no install step.
-
-The operator mirrors the Rust `Operator` trait method-for-method:
-`init(inputs) -> state`, `reset(inputs, state) -> outputs` and
-`compute(inputs, state, instant) -> outputs`. Inputs are
-`(sample_signal, features, target, rebalance_signal, universe)` as owned
-NumPy arrays; outputs are `(signal, predictions)`, with `NaN` for stocks the
-model could not price. Exceptions panic the node and poison the graph, so
-recoverable conditions should be values rather than raises.
+"""Incremental ridge regression mean predictor.
 
 A windowed mean predictor re-reads the whole training window and
 re-factorizes it every rebalance. The incremental version instead keeps a
@@ -20,16 +6,19 @@ re-factorizes it every rebalance. The incremental version instead keeps a
 time, so the per-rebalance cost is independent of how far back history
 reaches.
 
-The design splits into a generic *harness* and a model *pool*:
+The design splits into a generic *harness* and a model *pool* — the same
+shape as the other two operators (harness gates, masks and scatters; the
+model is pure math):
 
-* `IncrementalMeanPredictor` — the harness. On **every sampling tick** it folds
+* `MeanPredictor` — the harness. On **every sampling tick** it folds
   the pair that just became formable into the pool (`add_samples`, keyed by a
   monotone index) and drops the pairs that aged out of a rolling window
-  (`remove_samples`); on **rebalance ticks** it asks the pool to `predict`.
+  (`remove_samples`); on **rebalance ticks** it refits on the cadence, asks
+  the pool to `predict`, and emits through the universe/coverage mask.
   Folding eagerly rather than lazily is what bounds retention: each fold takes
   a single freshly-formable pair, so the harness never holds more than
   `target_offset + 1` cross-sections regardless of the window.
-* `RlsMeanPool` — the model. It maintains the aggregate Gram, the per-stock
+* `RLSMeanPool` — the model. It maintains the aggregate Gram, the per-stock
   valid-sample counts and the fitted parameters.
 
 **Fit on all samples.** The pool fits on every stock with valid features; the
@@ -47,16 +36,24 @@ from dataclasses import dataclass, field
 import numpy as np
 
 
+def active_mask(universe: np.ndarray, universe_size: int | None) -> np.ndarray:
+    """The stocks the universe marks active, checked against the sizing bound."""
+    mask = universe > 0
+    if universe_size is not None:
+        assert int(mask.sum()) <= universe_size, (
+            f"universe has {int(mask.sum())} nonzero entries, " f"exceeding universe_size={universe_size}"
+        )
+    return mask
+
+
+@dataclass(slots=True)
 class LinearParams:
     """Fitted coefficients with the pooled standardization scaler."""
 
-    __slots__ = ("beta", "intercept", "x_mean", "x_std")
-
-    def __init__(self, beta, intercept, x_mean, x_std):
-        self.beta = beta
-        self.intercept = intercept
-        self.x_mean = x_mean
-        self.x_std = x_std
+    beta: np.ndarray
+    intercept: float
+    x_mean: np.ndarray
+    x_std: np.ndarray
 
 
 def solve_standardized(
@@ -126,36 +123,26 @@ class DayMoments:
     valid: np.ndarray
 
 
-class RlsMeanPool:
-    """Pooled OLS / Ridge sample pool over a single aggregate Gram."""
+class RLSMeanPool:
+    """Pooled OLS / Ridge sample pool over a single aggregate Gram.
 
-    def __init__(
-        self,
-        *,
-        num_features: int,
-        alpha: float,
-        min_periods: int | None,
-        universe_size: int | None,
-        window: int | None,
-    ) -> None:
+    Pure model math: folding, down-dating, refitting and predicting. Which
+    stocks are worth *emitting* is the harness's concern.
+    """
+
+    def __init__(self, *, num_stocks: int, num_features: int, alpha: float) -> None:
         self.alpha = float(alpha)
-        self.min_periods = min_periods
-        self.universe_size = universe_size
         self.n = 0.0
         self.sx = np.zeros(num_features)
         self.sxx = np.zeros((num_features, num_features))
         self.sy = 0.0
         self.sxy = np.zeros(num_features)
         self.syy = 0.0
-        #: Per-stock valid-sample counts, for the `min_periods` filter. Sized
-        #: on the first fold, since the cross-section width is not known here.
-        self.counts: np.ndarray | None = None
-        #: Per-period contributions retained for down-dating, keyed by index —
-        #: only when a rolling window is in force. An expanding window never
-        #: subtracts anything, so it retains nothing at all.
-        self.days: dict | None = {} if window is not None else None
+        #: Per-stock valid-sample counts, for the `min_periods` filter.
+        self.counts = np.zeros(num_stocks)
+        #: Per-period contributions retained for down-dating, keyed by index.
+        self.days: dict[int, DayMoments] = {}
         self.params: LinearParams | None = None
-        self.fitted = False
 
     @staticmethod
     def contribution(x: np.ndarray, y: np.ndarray) -> DayMoments:
@@ -183,39 +170,28 @@ class RlsMeanPool:
         self.counts += sign * day.valid
 
     def add_samples(self, index: int, x: np.ndarray, y: np.ndarray) -> None:
-        if self.counts is None:
-            self.counts = np.zeros(x.shape[0])
         day = self.contribution(x, y)
         self.apply(day, 1.0)
-        if self.days is not None:
-            self.days[index] = day
+        self.days[index] = day
 
     def remove_samples(self, index: int) -> None:
         self.apply(self.days.pop(index), -1.0)
 
-    def predict(self, universe: np.ndarray, features: np.ndarray, refit: bool) -> np.ndarray:
-        if (refit or not self.fitted) and self.n > 0:
+    def fit(self) -> None:
+        """Re-solves the pooled Ridge from the current aggregate moments."""
+        if self.n > 0:
             self.params = solve_standardized(self.n, self.sx, self.sxx, self.sy, self.sxy, self.syy, self.alpha)
-            self.fitted = True
 
-        mask = universe > 0
-        if self.universe_size is not None:
-            assert int(mask.sum()) <= self.universe_size, (
-                f"universe has {int(mask.sum())} nonzero entries, " f"exceeding universe_size={self.universe_size}"
-            )
-        if self.min_periods is not None and self.counts is not None:
-            mask = mask & (self.counts >= self.min_periods)
-        mask = mask & np.isfinite(features).all(axis=1)
-
-        out = np.full(universe.shape[0], np.nan)
-        if self.fitted and mask.any():
-            p = self.params
-            out[mask] = (features[mask] - p.x_mean) / p.x_std @ p.beta + p.intercept
-        return out
+    def predict(self, features: np.ndarray) -> np.ndarray:
+        """Predictions for every stock (`NaN` rows where features are)."""
+        p = self.params
+        if p is None:
+            return np.full(features.shape[0], np.nan)
+        return (features - p.x_mean) / p.x_std @ p.beta + p.intercept
 
 
 @dataclass(slots=True)
-class IncrementalState:
+class MeanPredictorState:
     """Everything the incremental predictor carries between generations.
 
     `init` moves the whole build configuration in here so that `reset` and
@@ -224,25 +200,28 @@ class IncrementalState:
     operator instance is loaded from `__op__`.
     """
 
-    pool: RlsMeanPool
+    pool: RLSMeanPool
     target_offset: int
     refit_every: int
     #: The rolling training window in sampling periods, or `None` to expand.
     window: int | None
+    min_periods: int | None
+    universe_size: int | None
     #: The last `target_offset + 1` feature cross-sections — just enough to
     #: pair the oldest with the target that has now landed.
     features: deque = field(default_factory=deque)
+    #: The retained prediction, re-emitted on every non-rebalance tick.
     out: np.ndarray | None = None
     added: int = 0
     removed: int = 0
     rebalances: int = 0
 
 
-class IncrementalMeanPredictor:
+class MeanPredictor:
     type Inputs = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
     type Outputs = tuple[bool, np.ndarray]
     type Context = int
-    type State = IncrementalState
+    type State = MeanPredictorState
 
     def __init__(
         self,
@@ -269,29 +248,29 @@ class IncrementalMeanPredictor:
         self.min_periods = min_periods
         self.universe_size = universe_size
 
-    def init(self, inputs) -> IncrementalState:
+    def init(self, inputs) -> MeanPredictorState:
         _, features, _, _, universe = inputs
-        return IncrementalState(
-            pool=RlsMeanPool(
+        return MeanPredictorState(
+            pool=RLSMeanPool(
+                num_stocks=universe.shape[0],
                 num_features=features.shape[1],
                 alpha=self.alpha,
-                min_periods=self.min_periods,
-                universe_size=self.universe_size,
-                window=self.window,
             ),
             target_offset=self.target_offset,
             refit_every=self.refit_every,
             window=self.window,
+            min_periods=self.min_periods,
+            universe_size=self.universe_size,
             features=deque(maxlen=self.target_offset + 1),
             out=np.full(universe.shape[0], np.nan),
         )
 
     @staticmethod
-    def reset(_, state: IncrementalState):
+    def reset(_, state: MeanPredictorState):
         return (False, state.out)
 
     @staticmethod
-    def compute(inputs, state: IncrementalState, _):
+    def compute(inputs, state: MeanPredictorState, _):
         sample_signal, features, target, rebalance_signal, universe = inputs
 
         if sample_signal:
@@ -318,12 +297,26 @@ class IncrementalMeanPredictor:
             state.out = np.full(universe.shape[0], np.nan)
             return (True, state.out)
 
+        # Refit on the cadence, then emit through the mask: in the universe,
+        # enough coverage, finite current features. Everything else stays
+        # `NaN` — the predictor saying it has no opinion.
         refit = (state.rebalances % state.refit_every) == 0
         state.rebalances += 1
-        state.out = state.pool.predict(universe, state.features[-1], refit)
+        if refit or state.pool.params is None:
+            state.pool.fit()
+
+        current = state.features[-1]
+        mask = active_mask(universe, state.universe_size)
+        if state.min_periods is not None:
+            mask &= state.pool.counts >= state.min_periods
+        mask &= np.isfinite(current).all(axis=1)
+
+        out = np.full(universe.shape[0], np.nan)
+        if mask.any():
+            out[mask] = state.pool.predict(current)[mask]
+        state.out = out
         return (True, state.out)
 
 
-def build(*, alpha: float = 1.0, **kwargs) -> IncrementalMeanPredictor:
-    """Constructs an incremental pooled Ridge mean predictor."""
-    return IncrementalMeanPredictor(alpha=alpha, **kwargs)
+def build(*, alpha: float = 1.0, **kwargs) -> MeanPredictor:
+    return MeanPredictor(alpha=alpha, **kwargs)

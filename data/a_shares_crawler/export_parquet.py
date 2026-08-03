@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Re-create the long-format Parquet panels from `a-shares-crawler` CSV data.
+"""Create long-format Parquet panels from `a-shares-crawler` CSV data.
 
 Reads the per-symbol CSV histories written by the `a-shares-crawler` package
 (`<data-dir>/a_shares_history/<symbol>.<kind>.csv`) and writes one long-format
