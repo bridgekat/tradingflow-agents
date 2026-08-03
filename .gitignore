@@ -1,9 +1,51 @@
-# Per-run agent workspaces (clones/worktrees of the substrate repo).
-workspace/
-
-# Python environments and caches.
-.venv/
+# Python bytecode and caches
 __pycache__/
+*.py[cod]
+*$py.class
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+site/
+target/
+
+# Native extension artifacts
+*.pyd
+*.so
+*.dylib
+*.pdb
+
+# Virtual environments
+.venv/
+uv.lock
+
+# Test and coverage outputs
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
+.pytype/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE/editor files
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
 
 # API keys and local configuration.
 .env
