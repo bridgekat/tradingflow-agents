@@ -1,4 +1,5 @@
-//! NAV readout: summary statistics and the wide CSV the plot scripts read.
+//! NAV readout: summary statistics, the wide CSV the plot scripts read, and
+//! the long-format weights CSV written alongside it.
 
 use std::fmt::Write as _;
 use tradingflow::{data::Instant, graph::Graph, ports::SeriesPortHandle, time::UnixTime};
@@ -122,5 +123,85 @@ impl ReportTable {
         }
         std::fs::write(path, csv).unwrap_or_else(|e| panic!("write {path}: {e}"));
         println!("wrote {} NAV points to {path}", self.instants.len());
+    }
+}
+
+/// The weights CSV path: `<stem>_weights.<ext>` next to the NAV CSV.
+pub fn weights_path(output: &str) -> String {
+    let p = std::path::Path::new(output);
+    let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("csv");
+    p.with_file_name(format!("{stem}_weights.{ext}"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Accumulates each portfolio's recorded rebalance books and writes them as a
+/// long-format CSV — `date,portfolio,symbol,weight` — trimmed to significant
+/// holdings.
+///
+/// The weights are the optimizer's targets set on each rebalance date
+/// (executed at the next trading day's quotes, so a limit-locked or suspended
+/// name may not fill exactly), one block of rows per date in descending
+/// weight order. The residual `1 − Σ weights` — the book's cash — is
+/// reported under the pseudo-symbol `CASH`, so a block sums to 1 up to the
+/// trimmed dust.
+#[derive(Default)]
+pub struct WeightsTable {
+    /// `(portfolio, date, symbol, weight)` rows, in write order.
+    rows: Vec<(String, Instant, String, f64)>,
+}
+
+impl WeightsTable {
+    /// Read a recorded rebalance-book series and add its rows: holdings with
+    /// `weight ≥ min_weight` (and the `CASH` residual), largest first per
+    /// date. `symbols` is the cross-section axis the book indexes.
+    pub fn add(
+        &mut self,
+        g: &Graph<Instant, UnixTime>,
+        label: impl Into<String>,
+        symbols: &[String],
+        min_weight: f64,
+        h: SeriesPortHandle<f64, 1>,
+    ) {
+        // Suppress pure floating-point dust even when `min_weight` is zero.
+        let threshold = min_weight.max(1e-9);
+        let label = label.into();
+        let series = g.view(h);
+        let instants = series.instants();
+        for (k, &date) in instants.iter().enumerate() {
+            let book = series.at(k).1.to_contiguous();
+            let mut sum = 0.0;
+            let mut kept: Vec<(usize, f64)> = Vec::new();
+            for (i, &w) in book.iter().enumerate() {
+                if w.is_finite() && w > 0.0 {
+                    sum += w;
+                    if w >= threshold {
+                        kept.push((i, w));
+                    }
+                }
+            }
+            kept.sort_by(|a, b| b.1.total_cmp(&a.1));
+            for (i, w) in kept {
+                self.rows.push((label.clone(), date, symbols[i].clone(), w));
+            }
+            let cash = 1.0 - sum;
+            if cash >= threshold {
+                self.rows.push((label.clone(), date, "CASH".into(), cash));
+            }
+        }
+    }
+
+    /// Write the accumulated rows as `date,portfolio,symbol,weight` CSV.
+    pub fn write(&self, path: &str) {
+        let mut csv = String::from("date,portfolio,symbol,weight\n");
+        for (portfolio, date, symbol, weight) in &self.rows {
+            writeln!(csv, "{},{portfolio},{symbol},{weight}", format_date(*date)).unwrap();
+        }
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, csv).unwrap_or_else(|e| panic!("write {path}: {e}"));
+        println!("wrote {} weight rows to {path}", self.rows.len());
     }
 }

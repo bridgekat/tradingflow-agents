@@ -49,7 +49,7 @@ use args::Args;
 use data::{build_market_data, read_symbol_list};
 use features::build_features;
 use quotes::build_quotes;
-use report::ReportTable;
+use report::{ReportTable, WeightsTable, weights_path};
 use universe::build_cap_weighted_universe;
 
 /// Variance training window, in sampling (trading) days.
@@ -189,7 +189,10 @@ async fn main() {
             ),
         );
         let nav_series = b.op(series::record_all(), (daily, nav));
-        variants.push((delta, nav_series));
+        // Record the optimizer's target book on its rebalance pulse — one
+        // `[N]` cross-section per rebalance — for the weights CSV.
+        let book_series = b.op(series::record_all(), (rebalance, weights));
+        variants.push((delta, nav_series, book_series));
     }
 
     // The cap-weighted index over the same universe, as the benchmark.
@@ -211,11 +214,16 @@ async fn main() {
         .await;
     bar.finish();
 
-    // Print summary statistics per variant, write the wide CSV log.
+    // Print summary statistics per variant, write the wide NAV CSV and the
+    // long-format weights CSV alongside it.
     let mut table = ReportTable::default();
+    let mut books = WeightsTable::default();
     table.add(&g, "index", Some(args.start), index_nav_series);
-    for (delta, h) in variants {
-        table.add(&g, format!("delta_{delta}"), Some(args.start), h);
+    for (delta, nav, book) in variants {
+        let label = format!("delta_{delta}");
+        table.add(&g, label.as_str(), Some(args.start), nav);
+        books.add(&g, label, &symbols, args.min_weight, book);
     }
     table.write(&args.output);
+    books.write(&weights_path(&args.output));
 }

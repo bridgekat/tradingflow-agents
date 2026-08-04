@@ -10,9 +10,15 @@ pub struct Args {
     /// Directory containing the merged long-format Parquet tables.
     #[arg(long)]
     pub data_dir: String,
-    /// Path of the NAV curve CSV to write (one column per variant).
+    /// Path of the NAV curve CSV to write (one column per variant). The
+    /// rebalance weights are written alongside as `<stem>_weights.<ext>`
+    /// (long format: `date,portfolio,symbol,weight`).
     #[arg(long)]
     pub output: String,
+    /// Portfolio weights below this threshold are trimmed from the weights
+    /// CSV; `0` keeps every holding (only floating-point dust is dropped).
+    #[arg(long, default_value_t = 0.005)]
+    pub min_weight: f64,
     /// First date to backtest (inclusive), e.g. 2018-01-01; also the anchor
     /// of the rebalance calendar. The default covers the whole history.
     #[arg(long, value_parser = parse_date, default_value = "1990-01-01")]
