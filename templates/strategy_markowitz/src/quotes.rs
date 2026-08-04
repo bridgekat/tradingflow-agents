@@ -37,7 +37,7 @@ pub const PRICE_LIMIT: f64 = 0.10;
 pub const TICK_SIZE: f64 = 0.01;
 /// A stock with `NaN` prices for more than this many consecutive trading
 /// days counts as delisted (the panel carries no listing state).
-pub const DELIST_DAYS: u32 = 20;
+pub const DELIST_DAYS: u32 = 252;
 
 /// One-pass synthetic quote book over `(daily_signals, carried_close)`.
 /// Set/stale is stated by the signal array (a per-element pulse on trading

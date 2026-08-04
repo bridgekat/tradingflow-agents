@@ -98,14 +98,14 @@ class Mode(IntEnum):
 
     - ``MIN_VARIANCE_GIVEN_RETURN``: minimize ``x^T Sigma x`` s.t. ``mu^T x >= bound``.
     - ``MAX_RETURN_GIVEN_STD_DEV``: maximize ``mu^T x`` s.t. ``sqrt(x^T Sigma x) <= bound``.
-    - ``MIN_MEAN_VARIANCE``: maximize ``mu^T x - bound * x^T Sigma x``.
-    - ``MIN_MEAN_STD_DEV``: maximize ``mu^T x - bound * sqrt(x^T Sigma x)``.
+    - ``MAX_MEAN_MINUS_VARIANCE``: maximize ``mu^T x - bound * x^T Sigma x``.
+    - ``MAX_MEAN_MINUS_STD_DEV``: maximize ``mu^T x - bound * sqrt(x^T Sigma x)``.
     """
 
     MIN_VARIANCE_GIVEN_RETURN = 1
     MAX_RETURN_GIVEN_STD_DEV = 2
-    MIN_MEAN_VARIANCE = 3
-    MIN_MEAN_STD_DEV = 4
+    MAX_MEAN_MINUS_VARIANCE = 3
+    MAX_MEAN_MINUS_STD_DEV = 4
 
 
 def build_solver(
@@ -140,9 +140,9 @@ def build_solver(
         case Mode.MAX_RETURN_GIVEN_STD_DEV:
             objective = cp.Maximize(expected)
             constraints.append(variance <= bound * bound)
-        case Mode.MIN_MEAN_VARIANCE:
+        case Mode.MAX_MEAN_MINUS_VARIANCE:
             objective = cp.Maximize(expected - bound * variance)
-        case Mode.MIN_MEAN_STD_DEV:
+        case Mode.MAX_MEAN_MINUS_STD_DEV:
             deviation = cp.norm(cp.hstack([factors @ x, cp.multiply(idio, x)]))
             objective = cp.Maximize(expected - bound * deviation)
 
@@ -254,7 +254,7 @@ class MeanVariancePortfolio:
     def __init__(
         self,
         *,
-        mode: "Mode | int",
+        mode: Mode,
         bound: float,
         long_only: bool = True,
         full_position: bool = True,
@@ -324,5 +324,5 @@ class MeanVariancePortfolio:
         return (True, state.weights)
 
 
-def build(*, mode: Mode | int = Mode.MIN_MEAN_VARIANCE, **kwargs) -> MeanVariancePortfolio:
+def build(*, mode: Mode | int = Mode.MAX_MEAN_MINUS_VARIANCE, **kwargs) -> MeanVariancePortfolio:
     return MeanVariancePortfolio(mode=Mode(mode), **kwargs)

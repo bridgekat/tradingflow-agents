@@ -383,7 +383,7 @@ class VariancePredictor:
 
 def build(
     *,
-    target: int | Target = Target.COMMON_COVARIANCE,
+    target: int,
     factor_rank: int = 20,
     alpha_subsample: int = 512,
     seed: int = 0,

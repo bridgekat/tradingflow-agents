@@ -17,7 +17,8 @@ dependencies = [
     "scipy>=1.18.0",
     "pandas>=3.0.5",
     "pyarrow>=25.0.0",
-    "tradingflow",
+    "cvxpy",
+    "scs",
 ]
 
 # One executable per agent.
@@ -29,9 +30,3 @@ packages = ["tradingflow_agents"]
 
 [tool.black]
 line-length = 120
-
-[tool.uv.workspace]
-members = ["tradingflow"]
-
-[tool.uv.sources]
-tradingflow = { workspace = true, editable = true }

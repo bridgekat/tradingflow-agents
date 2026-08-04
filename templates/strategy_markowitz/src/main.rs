@@ -20,9 +20,10 @@
 //!   calendar.
 //! - The three Python operators — the incremental ridge mean predictor, the
 //!   shrinkage variance predictor and the Markowitz optimizer — are loaded
-//!   from strategy-local, self-contained files. The `main` function appends
-//!   the crate's `python/` directory to the embedded interpreter's `sys.path`,
-//!   so that `py_operator_module` can resolve them like installed packages.
+//!   from strategy-local, self-contained files. [`interpreter::initialize`]
+//!   appends the crate's `python/` directory to the embedded interpreter's
+//!   `sys.path`, so that `py_operator_module` can resolve them like installed
+//!   packages.
 //!   This makes the whole modeling pipeline easier to modify and experiment
 //!   with. The Markowitz solves release the GIL, so the sweep's variants solve
 //!   in parallel on the pool.
@@ -30,6 +31,7 @@
 mod args;
 mod data;
 mod features;
+mod python;
 mod quotes;
 mod report;
 mod universe;
@@ -38,9 +40,10 @@ use clap::Parser;
 use indicatif::ProgressBar;
 use pyo3::prelude::*;
 use tradingflow::{
-    graph::{Builder, Pool},
-    operators::{portfolio, predictor, series, stats, trader},
-    python::{attach, py_operator_module, py_params},
+    graph::{Builder, OperatorExt, Pool},
+    operators::{elem, series, stats, trader},
+    ports::{ArrayPort, SignalPort},
+    python::{py_operator_module, py_params},
     sources::sync,
     time::UnixTime,
 };
@@ -52,8 +55,10 @@ use quotes::build_quotes;
 use report::{ReportTable, WeightsTable, weights_path};
 use universe::build_cap_weighted_universe;
 
+/// Mean training window, in sampling (trading) days.
+const MEAN_WINDOW: Option<usize> = None;
 /// Variance training window, in sampling (trading) days.
-const COV_WINDOW: usize = 252;
+const COV_WINDOW: Option<usize> = Some(252);
 /// Minimum valid observations for a stock to be considered predictable.
 const MIN_PERIODS: usize = 63;
 /// Rank of the factor-model covariance the Markowitz solve optimizes against.
@@ -63,13 +68,9 @@ const FACTOR_RANK: usize = 20;
 async fn main() {
     let args = Args::parse();
 
-    // Make `py_operator_module` resolve the strategy-local operators.
-    let code = std::ffi::CString::new(format!(
-        "import sys; sys.path.append({:?})",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/python"),
-    ))
-    .unwrap();
-    attach(|py| py.run(&code, None, None).expect("cannot extend sys.path"));
+    // Start the embedded interpreter as the repository's virtual environment,
+    // with the strategy-local operators resolvable by `py_operator_module`.
+    python::initialize();
 
     // Load the complete symbol list with its industry tags.
     let data::SymbolList {
@@ -118,13 +119,22 @@ async fn main() {
     // Mean predictor: regresses the feature panel against next-day demeaned
     // log returns, adding samples daily and refitting per rebalance.
     // Masked and sized to the universe.
+    type MeanPredictorInputs = (
+        SignalPort<0>,
+        ArrayPort<f64, 2>,
+        ArrayPort<f64, 1>,
+        SignalPort<0>,
+        ArrayPort<f64, 1>,
+    );
+    type MeanPredictorOutputs = (SignalPort<0>, ArrayPort<f64, 1>);
+
     let (_, predicted_returns) = b.op(
-        py_operator_module::<predictor::mean::Inputs, predictor::mean::Outputs>(
-            "mean",
+        py_operator_module::<MeanPredictorInputs, MeanPredictorOutputs>(
+            "mean_predictor",
             py_params(|d| {
                 d.set_item("target_offset", 1)?; // features[t] predict target[t + 1]
                 d.set_item("refit_every", 1)?; // refit on every rebalance pulse
-                d.set_item("max_periods", None::<usize>)?; // fit on all history
+                d.set_item("max_periods", MEAN_WINDOW)?; // fit on all history
                 d.set_item("min_periods", MIN_PERIODS)?;
                 d.set_item("universe_size", k)?;
                 d.set_item("alpha", args.ridge_alpha)
@@ -137,16 +147,25 @@ async fn main() {
     // log returns over the trailing year, and emits it as a
     // `[FACTOR_RANK + 1, N]` low-rank-plus-diagonal approximation.
     // Masked and sized to the universe.
+    type VariancePredictorInputs = (
+        SignalPort<0>,
+        ArrayPort<f64, 2>,
+        ArrayPort<f64, 1>,
+        SignalPort<0>,
+        ArrayPort<f64, 1>,
+    );
+    type VariancePredictorOutputs = (SignalPort<0>, ArrayPort<f64, 2>);
+
     let (_, predicted_cov) = b.op(
-        py_operator_module::<predictor::variance::Inputs, predictor::variance::Outputs>(
-            "variance",
+        py_operator_module::<VariancePredictorInputs, VariancePredictorOutputs>(
+            "variance_predictor",
             py_params(|d| {
                 d.set_item("refit_every", 1)?;
                 d.set_item("max_periods", COV_WINDOW)?;
                 d.set_item("min_periods", MIN_PERIODS)?;
                 d.set_item("universe_size", k)?;
                 d.set_item("factor_rank", FACTOR_RANK)?; // must match the optimizer's
-                d.set_item("target", predictor::variance::Target::SingleIndex as u8)
+                d.set_item("target", 2) // constant correlation shrinkage target
             }),
         ),
         (daily, features.panel, target, rebalance, universe),
@@ -156,30 +175,39 @@ async fn main() {
     // trader per risk-aversion value, all sharing the predictors above.
     // Sweeping other parameters can be done in a similar fashion: build
     // several parallel paths with different parameters.
+    type MeanVariancePortfolioInputs = (
+        SignalPort<0>,
+        ArrayPort<f64, 1>,
+        ArrayPort<f64, 1>,
+        ArrayPort<f64, 2>,
+    );
+    type MeanVariancePortfolioOutputs = (SignalPort<0>, ArrayPort<f64, 1>);
+
     let mut variants = Vec::new();
     for delta in args.risk_aversion.iter() {
-        let (rebalance, weights) =
-            b.op(
-                py_operator_module::<
-                    portfolio::mean_variance::Inputs,
-                    portfolio::mean_variance::Outputs,
-                >(
-                    "portfolio",
-                    py_params(|d| {
-                        d.set_item("logarithmic", true)?; // moments are log returns
-                        d.set_item("max_universe_size", k)?; // size the solver to the universe
-                        d.set_item(
-                            "mode",
-                            portfolio::mean_variance::Mode::MinMeanVariance as u8,
-                        )?;
-                        d.set_item("bound", delta)?;
-                        d.set_item("long_only", true)?; // produce no short or leveraged positions
-                        d.set_item("full_position", false)?; // may hold cash
-                        d.set_item("factor_rank", FACTOR_RANK) // matches the risk panel
-                    }),
-                ),
-                (rebalance, universe, predicted_returns, predicted_cov),
-            );
+        let (rebalance, weights) = b.op(
+            py_operator_module::<MeanVariancePortfolioInputs, MeanVariancePortfolioOutputs>(
+                "mean_variance_portfolio",
+                py_params(|d| {
+                    d.set_item("logarithmic", true)?; // input predictions are on log scale
+                    d.set_item("max_universe_size", k)?; // size the solver to the universe
+                    d.set_item("mode", 3)?; // objective: maximize (mean - delta * variance)
+                    d.set_item("bound", delta)?;
+                    d.set_item("long_only", true)?; // aim for no short or leveraged positions
+                    d.set_item("full_position", true)?; // aim for full positions
+                    d.set_item("factor_rank", FACTOR_RANK) // matches the risk panel
+                }),
+            ),
+            (rebalance, universe, predicted_returns, predicted_cov),
+        );
+
+        // Limit weights to long-only and non-leveraged.
+        let weights = b.op(
+            elem::clampf(0.0, f64::INFINITY).then(stats::scale_down(1.0)),
+            weights,
+        );
+
+        // Simulate frictionless trading.
         let (_positions, _cash, nav) = b.op(
             trader::fixed::benchmark(true, args.initial_cash),
             (
@@ -189,8 +217,6 @@ async fn main() {
             ),
         );
         let nav_series = b.op(series::record_all(), (daily, nav));
-        // Record the optimizer's target book on its rebalance pulse — one
-        // `[N]` cross-section per rebalance — for the weights CSV.
         let book_series = b.op(series::record_all(), (rebalance, weights));
         variants.push((delta, nav_series, book_series));
     }
