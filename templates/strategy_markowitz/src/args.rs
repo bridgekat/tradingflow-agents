@@ -2,6 +2,8 @@ use chrono::{DateTime, NaiveDate};
 use clap::Parser;
 use tradingflow::data::{Duration, Instant};
 
+use crate::features::FeatureSet;
+
 /// CLI arguments.
 #[derive(Parser)]
 pub struct Args {
@@ -31,18 +33,31 @@ pub struct Args {
     /// market cap, re-selected at every rebalance; `0` selects the whole
     /// market. Also sizes the Markowitz solver and the predictors' active
     /// blocks.
-    #[arg(long, default_value_t = 3800)]
+    #[arg(long, default_value_t = 0)]
     pub universe_size: usize,
     /// Initial cash.
     #[arg(long, default_value_t = 1_000_000.0)]
     pub initial_cash: f64,
-    /// Markowitz risk-aversion coefficient(s); a comma-separated list sweeps
-    /// one portfolio per value against shared predictors.
-    #[arg(long, value_delimiter = ',', default_value = "0.5,1,2,5,10,25,50,100")]
-    pub risk_aversion: Vec<f64>,
+    /// Feature set(s) to build the panel from (repeatable or
+    /// comma-separated); defaults to all sets.
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_values = ["basic", "alpha101"]
+    )]
+    pub features: Vec<FeatureSet>,
     /// Ridge regression L2 penalty.
     #[arg(long, default_value_t = 0.01)]
     pub ridge_alpha: f64,
+    /// Markowitz risk-aversion coefficient(s); a comma-separated list sweeps
+    /// one portfolio per value against shared predictors.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values = ["0.5", "1", "2", "5", "10", "25", "50", "100"]
+    )]
+    pub risk_aversion: Vec<f64>,
 }
 
 impl Args {

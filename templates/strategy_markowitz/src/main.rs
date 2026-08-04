@@ -71,8 +71,11 @@ async fn main() {
     .unwrap();
     attach(|py| py.run(&code, None, None).expect("cannot extend sys.path"));
 
-    // Load the complete symbol list.
-    let symbols = read_symbol_list(&format!("{}/symbol_list.parquet", args.data_dir));
+    // Load the complete symbol list with its industry tags.
+    let data::SymbolList {
+        symbols,
+        industries,
+    } = read_symbol_list(&format!("{}/symbol_list.parquet", args.data_dir));
     let k = args.resolved_universe_size(symbols.len());
     assert!(k >= 2, "the tradable universe needs at least 2 symbols");
     println!(
@@ -86,8 +89,10 @@ async fn main() {
     let mut pool = Pool::new(std::thread::available_parallelism().unwrap().get());
     let mut b = Builder::new(UnixTime);
 
-    // Market data (required fields only).
+    // Market data: every panel column (via `data.fields`) plus derived fields.
     let data = build_market_data(&mut b, &symbols, &args);
+    let share_divs = data.field("dividends.share");
+    let cash_divs = data.field("dividends.cash");
 
     // Trading day signal.
     let daily = data.daily;
@@ -96,13 +101,13 @@ async fn main() {
     let rebalance = b.source(sync::signal_iter(args.rebalance_instants().into_iter()));
 
     // Extract features from market data.
-    let features = build_features(&mut b, &data);
+    let features = build_features(&mut b, &data, &args.features, &industries);
 
     // Cap-weighted top-`k` universe weights.
     let universe = build_cap_weighted_universe(&mut b, &data, rebalance, k);
 
     // Synthetic quote book.
-    let (flags, bids, asks) = build_quotes(&mut b, data.price_signals, data.close_carried);
+    let (flags, bids, asks) = build_quotes(&mut b, data.price_signals, data.field("prices.close"));
 
     // Log-returns as prediction target (raw and demeaned).
     let target = b.op(stats::winsorize(0.01), data.log_return);
@@ -179,7 +184,7 @@ async fn main() {
             trader::fixed::benchmark(true, args.initial_cash),
             (
                 (daily, flags, bids, asks),
-                (data.div_signals, data.share_divs, data.cash_divs),
+                (data.div_signals, share_divs, cash_divs),
                 (rebalance, weights),
             ),
         );
@@ -192,7 +197,7 @@ async fn main() {
         trader::fixed::benchmark(true, args.initial_cash),
         (
             (daily, flags, bids, asks),
-            (data.div_signals, data.share_divs, data.cash_divs),
+            (data.div_signals, share_divs, cash_divs),
             (rebalance, universe),
         ),
     );

@@ -94,6 +94,6 @@ pub fn build_cap_weighted_universe(
     rebalance: SignalPortHandle<0>,
     k: usize,
 ) -> ArrayPortHandle<f64, 1> {
-    let circ_cap = b.op(elem::mul(), (m.close, m.circ_shares));
+    let circ_cap = b.op(elem::mul(), (m.close, m.field("shares.circulating")));
     b.op(CapWeightedTopK { k }, (rebalance, circ_cap))
 }
