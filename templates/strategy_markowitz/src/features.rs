@@ -20,6 +20,8 @@ mod alpha101;
 mod alpha158;
 mod alpha360;
 mod basic;
+mod cicc_fund;
+mod cicc_pv;
 mod context;
 
 use std::collections::HashMap;
@@ -36,6 +38,8 @@ use alpha101::{build_context_alpha101, build_features_alpha101};
 use alpha158::build_features_alpha158;
 use alpha360::build_features_alpha360;
 use basic::build_features_basic;
+use cicc_fund::build_features_cicc_fund;
+use cicc_pv::build_features_cicc_pv;
 use context::build_price_context;
 
 /// The selectable feature sets (`--features`). Doc comments double as the
@@ -54,6 +58,16 @@ pub enum FeatureSet {
     /// 60-day window of six daily series. Costly in memory: 354 lag nodes,
     /// each buffering its own window of the whole cross-section.
     Alpha360,
+    /// The CICC fundamental factor handbook catalog
+    /// (`build_features_cicc_fund`), 基本面因子手册's implementable subset.
+    /// Needs `--warmup-days` around 1000: a 365-day TTM under a 365-day lag,
+    /// plus the predictors' min-periods, before the first prediction.
+    CiccFund,
+    /// The CICC price-volume factor handbook catalog
+    /// (`build_features_cicc_pv`), 价量因子手册's OHLCV-derivable subset.
+    /// Needs `--warmup-days` around 700: 252-tick windows plus the
+    /// predictors' min-periods, before the first prediction.
+    CiccPv,
 }
 
 /// The model-ready feature panel.
@@ -115,15 +129,19 @@ pub fn build_features(
     if sets.contains(&FeatureSet::Basic) {
         entries.extend(build_features_basic(b, m));
     }
+    if sets.contains(&FeatureSet::CiccFund) {
+        entries.extend(build_features_cicc_fund(b, m));
+    }
 
-    // The ported catalogs lower through one shared `Context`, so their common
-    // subexpressions hash-cons into single graph nodes. Alpha101's fields are
-    // a superset of the price fields the other two read, so it supplies the
-    // context whenever it is selected.
+    // The expression catalogs lower through one shared `Context`, so their
+    // common subexpressions hash-cons into single graph nodes. Alpha101's
+    // fields are a superset of the price fields the others read, so it
+    // supplies the context whenever it is selected.
     let alpha101 = sets.contains(&FeatureSet::Alpha101);
     let alpha158 = sets.contains(&FeatureSet::Alpha158);
     let alpha360 = sets.contains(&FeatureSet::Alpha360);
-    if alpha101 || alpha158 || alpha360 {
+    let cicc_pv = sets.contains(&FeatureSet::CiccPv);
+    if alpha101 || alpha158 || alpha360 || cicc_pv {
         let mut ctx = match alpha101 {
             true => build_context_alpha101(b, m, industries),
             false => build_price_context(b, m),
@@ -137,23 +155,27 @@ pub fn build_features(
         if alpha360 {
             entries.extend(build_features_alpha360(b, &mut ctx));
         }
+        if cicc_pv {
+            entries.extend(build_features_cicc_pv(b, &mut ctx, m));
+        }
     }
     assert!(!entries.is_empty(), "no features selected");
 
-    // Qlib names four features the same way in both Alpha158 and Alpha360
-    // (`OPEN0`, `HIGH0`, `LOW0`, `VWAP0`), for the same expression. Keep the
-    // first of each, and check that the later one really did lower to the same
-    // wire — so two genuinely different features sharing a name still fail
-    // loudly rather than silently losing one.
+    // Some catalogs share names: Qlib names four features identically in
+    // Alpha158 and Alpha360 (`OPEN0`, `HIGH0`, `LOW0`, `VWAP0`) for the same
+    // expression, which hash-consing collapses to the same wire; `basic` and
+    // `cicc-fund` both define `BP_LR` / `EP_TTM` with the same formula, but
+    // hand-wired nodes are not hash-consed, so their wires differ. Keep the
+    // first of each name, silently when the wires are identical and with a
+    // warning otherwise — so an unintended collision of genuinely different
+    // features is at least visible.
     let mut seen: HashMap<String, ArrayPortHandle<f64, 1>> = HashMap::new();
     entries.retain(|(name, h)| match seen.insert(name.clone(), *h) {
         None => true,
         Some(first) => {
-            assert_eq!(
-                first.index(),
-                h.index(),
-                "two different features are both named {name:?}"
-            );
+            if first.index() != h.index() {
+                eprintln!("warning: duplicate feature {name:?}; keeping the first");
+            }
             false
         }
     });

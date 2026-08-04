@@ -22,7 +22,10 @@ pub struct Args {
     pub end: Option<Instant>,
     /// Calendar days of data read before `--start` to warm up the rolling
     /// features, the TTM aggregates and the predictors' training windows.
-    /// Trading (and the reported NAV) still begins at `--start`.
+    /// Trading (and the reported NAV) still begins at `--start`. The default
+    /// covers the `basic` and alpha catalogs; the CICC catalogs' year-lagged
+    /// features need ~700 (cicc-pv) to ~1000 (cicc-fund) days before the
+    /// predictors see enough finite history to emit a first prediction.
     #[arg(long, default_value_t = 400)]
     pub warmup_days: i64,
     /// Rebalance the portfolios every this many calendar days. A rebalance

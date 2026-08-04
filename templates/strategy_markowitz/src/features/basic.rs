@@ -11,7 +11,7 @@ use crate::data::MarketData;
 /// Retention window lengths for month / quarter / year.
 const MONTH: Retention = Retention::duration(Duration::from_days(30));
 const QUARTER: Retention = Retention::duration(Duration::from_days(90));
-const YEAR: Retention = Retention::duration(Duration::from_days(365));
+pub const YEAR: Retention = Retention::duration(Duration::from_days(365));
 
 /// Annualized (YTD → per-year) report flow named `name`, gated per element by
 /// the panel's per-stock report signals. The name's first segment is the
@@ -69,7 +69,6 @@ pub fn ttm(
 }
 
 /// Year-over-year delta.
-#[allow(dead_code)]
 pub fn change(
     b: &mut Builder<Instant, UnixTime>,
     daily: SignalPortHandle<0>,
@@ -79,7 +78,6 @@ pub fn change(
 }
 
 /// Year-over-year growth.
-#[allow(dead_code)]
 pub fn growth(
     b: &mut Builder<Instant, UnixTime>,
     daily: SignalPortHandle<0>,
@@ -118,7 +116,7 @@ pub fn build_features_basic(
 
     // ---- Size ----
     let ln_mc = b.op(elem::ln(), market_cap);
-    add("LN_MC", ln_mc);
+    add("Ln_MC", ln_mc);
 
     // ---- Valuation ----
     // The fundamentals' cross-sections are heavy-tailed ratios, so the rank
