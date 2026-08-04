@@ -340,7 +340,7 @@ class VariancePredictor:
         self.min_periods = min_periods
         self.universe_size = universe_size
 
-    def init(self, inputs) -> VariancePredictorState:
+    def init(self, inputs: Inputs) -> State:
         *_, universe = inputs
         return VariancePredictorState(
             fit=self.fit,
@@ -353,11 +353,11 @@ class VariancePredictor:
         )
 
     @staticmethod
-    def reset(_, state: VariancePredictorState):
+    def reset(_: Inputs, state: State) -> Outputs:
         return (False, state.out)
 
     @staticmethod
-    def compute(inputs, state: VariancePredictorState, _):
+    def compute(inputs: Inputs, state: State, _: Context) -> Outputs:
         sample_signal, _features, target, rebalance_signal, universe = inputs
 
         if sample_signal:

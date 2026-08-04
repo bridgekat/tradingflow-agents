@@ -28,6 +28,12 @@ from typing import Any
 
 import numpy as np
 
+#: A predicted per-period return at or beyond this magnitude is treated as
+#: the predictor malfunctioning rather than as an opinion, and the stock is
+#: masked out of the solve exactly like a NaN. For log moments this also
+#: keeps `to_linear_factor`'s `expm1` far away from overflow.
+MU_LIMIT = 1.0
+
 # ---------------------------------------------------------------------------
 # Slot plumbing: scatter the factor-form risk into the fixed solver size.
 # ---------------------------------------------------------------------------
@@ -265,7 +271,7 @@ class MeanVariancePortfolio:
         self.max_universe_size = max_universe_size
         self.logarithmic = logarithmic
 
-    def init(self, inputs) -> MeanVariancePortfolioState:
+    def init(self, inputs: Inputs) -> State:
         universe = inputs[1]
         n = universe.shape[0]
         m = n if self.max_universe_size is None else self.max_universe_size
@@ -277,20 +283,21 @@ class MeanVariancePortfolio:
         )
 
     @staticmethod
-    def reset(_, state: MeanVariancePortfolioState):
+    def reset(_: Inputs, state: State) -> Outputs:
         return (False, state.weights)
 
     @staticmethod
-    def compute(inputs, state: MeanVariancePortfolioState, _):
+    def compute(inputs: Inputs, state: State, _: Context) -> Outputs:
         rebalance_signal, universe, mu, risk = inputs
         if not rebalance_signal:
             return (False, state.weights)
 
         # A stock is worth optimizing over when it is in the universe and every
         # moment the portfolio depends on is finite for it. A NaN prediction is
-        # the predictor saying it has no opinion, not a zero one. The risk
+        # the predictor saying it has no opinion, not a zero one — and a finite
+        # but absurd one ([`MU_LIMIT`]) counts as no opinion too. The risk
         # panel's last row is the idiosyncratic std-dev, its scatter mask.
-        mask = (universe > 0) & np.isfinite(mu) & np.isfinite(risk[-1])
+        mask = (universe > 0) & np.isfinite(mu) & (np.abs(mu) < MU_LIMIT) & np.isfinite(risk[-1])
 
         weights = np.zeros(universe.shape[0])
         if mask.any():

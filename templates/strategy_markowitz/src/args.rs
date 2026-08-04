@@ -38,13 +38,12 @@ pub struct Args {
     /// Initial cash.
     #[arg(long, default_value_t = 1_000_000.0)]
     pub initial_cash: f64,
-    /// Feature set(s) to build the panel from (repeatable or
-    /// comma-separated); defaults to all sets.
+    /// Feature set(s) to build the panel from (repeatable or comma-separated).
     #[arg(
         long,
         value_enum,
         value_delimiter = ',',
-        default_values = ["basic", "alpha101"]
+        default_values = ["basic"]
     )]
     pub features: Vec<FeatureSet>,
     /// Ridge regression L2 penalty.

@@ -1,7 +1,7 @@
 use tradingflow::{
     data::{Duration, Instant, Retention},
     graph::Builder,
-    operators::{elem, feature, rolling},
+    operators::{elem, feature, rolling, stats},
     ports::{ArrayPortHandle, SignalPortHandle},
     time::UnixTime,
 };
@@ -89,7 +89,7 @@ pub fn growth(
 }
 
 /// The baseline feature catalog: a small hand-written set of `(name, raw
-/// value)` entries, one per feature, not yet rank-imputed.
+/// value)` entries, one per feature, not yet imputed.
 pub fn build_features_basic(
     b: &mut Builder<Instant, UnixTime>,
     m: &MarketData,
@@ -108,22 +108,27 @@ pub fn build_features_basic(
 
     // ---- Momentum & reversal ----
     let rev_1m = b.op(rolling::diff(MONTH), (daily, m.log_adj)); // trailing 1-month log return
-    let mom_1y = b.op(rolling::diff(YEAR), (daily, m.log_adj));
     add("REV_1M", rev_1m);
-    add("MOM_12M", b.op(elem::sub(), (mom_1y, rev_1m))); // 12-month minus most recent month
+    let mom_12m = b.op(rolling::diff(YEAR), (daily, m.log_adj));
+    add("MOM_12M", b.op(elem::sub(), (mom_12m, rev_1m))); // 12-month minus most recent month
 
     // ---- Volatility ----
-    add(
-        "VOL_3M",
-        b.op(rolling::std_dev(QUARTER, 0), (daily, m.log_return)),
-    );
+    let vol_3m = b.op(rolling::std_dev(QUARTER, 0), (daily, m.log_return));
+    add("VOL_3M", vol_3m);
 
     // ---- Size ----
-    add("LN_MC", b.op(elem::ln(), market_cap));
+    let ln_mc = b.op(elem::ln(), market_cap);
+    add("LN_MC", ln_mc);
 
     // ---- Valuation ----
-    add("BP_LR", b.op(elem::div(), (parent_equity, market_cap))); // 净资产 / 总市值
-    add("EP_TTM", b.op(elem::div(), (np_ttm, market_cap))); // 净利润 TTM / 总市值
+    // The fundamentals' cross-sections are heavy-tailed ratios, so the rank
+    // transform is part of their definition: percentile to `[0, 1]`, with a
+    // missing value staying `NaN` for the finalizer's mean imputation (the
+    // neutral median `0.5`).
+    let bp = b.op(elem::div(), (parent_equity, market_cap)); // 净资产 / 总市值
+    add("BP_LR", b.op(stats::percentile(), bp));
+    let ep = b.op(elem::div(), (np_ttm, market_cap)); // 净利润 TTM / 总市值
+    add("EP_TTM", b.op(stats::percentile(), ep));
 
     // ---- Liquidity ----
     let turnover = b.op(elem::div(), (m.volume, m.field("shares.circulating"))); // daily 换手率

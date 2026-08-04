@@ -46,6 +46,35 @@ def active_mask(universe: np.ndarray, universe_size: int | None) -> np.ndarray:
     return mask
 
 
+#: Standardized features are clamped to this many pooled standard deviations
+#: at prediction. The panel's winsorization is per-cross-section and the
+#: scaler is pooled over history, so a regime-shifted day can standardize to
+#: an astronomical z-score — which, pushed through the coefficients, overflows
+#: downstream consumers (e.g. `expm1` in the portfolio's lognormal-to-linear
+#: mapping). Inside the band the transform is the identity, so a sane
+#: cross-section is untouched; a tail day contributes at most `Z_CLIP` per
+#: feature, bounding the prediction at `Z_CLIP * ‖beta‖₁` around the
+#: intercept.
+Z_CLIP = 5.0
+
+#: A feature value at or beyond this magnitude marks its whole row invalid,
+#: exactly like a NaN — for the training pool and the prediction mask alike.
+#: The panel's winsorization is per-cross-section, so a day where over 1% of
+#: the section spikes (near-zero denominators in the ported catalogs) can
+#: pass through values that are absurd as regression inputs: they would
+#: dominate the pooled scaler, and their squares can overflow the Gram to
+#: `inf` — which a later rolling-window down-date turns into a permanent
+#: `NaN` (`inf - inf`). The limit sits far above every legitimate feature
+#: scale while keeping `x²` sums comfortably inside `f64`.
+FEATURE_LIMIT = 1e8
+
+
+def valid_rows(x: np.ndarray) -> np.ndarray:
+    """Rows of the feature cross-section that are usable: every entry finite
+    and inside the [`FEATURE_LIMIT`] scale (a NaN or ±inf compares `False`)."""
+    return (np.abs(x) < FEATURE_LIMIT).all(axis=1)
+
+
 @dataclass(slots=True)
 class LinearParams:
     """Fitted coefficients with the pooled standardization scaler."""
@@ -147,7 +176,7 @@ class RLSMeanPool:
     @staticmethod
     def contribution(x: np.ndarray, y: np.ndarray) -> DayMoments:
         """Reduces one period's cross-section to its moments."""
-        valid = np.isfinite(x).all(axis=1) & np.isfinite(y)
+        valid = valid_rows(x) & np.isfinite(y)
         xr, yr = x[valid], y[valid]
         return DayMoments(
             n=float(xr.shape[0]),
@@ -183,11 +212,13 @@ class RLSMeanPool:
             self.params = solve_standardized(self.n, self.sx, self.sxx, self.sy, self.sxy, self.syy, self.alpha)
 
     def predict(self, features: np.ndarray) -> np.ndarray:
-        """Predictions for every stock (`NaN` rows where features are)."""
+        """Predictions for every stock (`NaN` rows where features are), with
+        the standardized features clamped to the [`Z_CLIP`] band."""
         p = self.params
         if p is None:
             return np.full(features.shape[0], np.nan)
-        return (features - p.x_mean) / p.x_std @ p.beta + p.intercept
+        z = np.clip((features - p.x_mean) / p.x_std, -Z_CLIP, Z_CLIP)
+        return z @ p.beta + p.intercept
 
 
 @dataclass(slots=True)
@@ -248,7 +279,7 @@ class MeanPredictor:
         self.min_periods = min_periods
         self.universe_size = universe_size
 
-    def init(self, inputs) -> MeanPredictorState:
+    def init(self, inputs: Inputs) -> State:
         _, features, _, _, universe = inputs
         return MeanPredictorState(
             pool=RLSMeanPool(
@@ -266,11 +297,13 @@ class MeanPredictor:
         )
 
     @staticmethod
-    def reset(_, state: MeanPredictorState):
+    def reset(_: Inputs, state: State) -> Outputs:
+        assert state.out is not None
         return (False, state.out)
 
     @staticmethod
-    def compute(inputs, state: MeanPredictorState, _):
+    def compute(inputs: Inputs, state: State, _: Context) -> Outputs:
+        assert state.out is not None
         sample_signal, features, target, rebalance_signal, universe = inputs
 
         if sample_signal:
@@ -298,7 +331,7 @@ class MeanPredictor:
             return (True, state.out)
 
         # Refit on the cadence, then emit through the mask: in the universe,
-        # enough coverage, finite current features. Everything else stays
+        # enough coverage, usable current features. Everything else stays
         # `NaN` — the predictor saying it has no opinion.
         refit = (state.rebalances % state.refit_every) == 0
         state.rebalances += 1
@@ -309,7 +342,7 @@ class MeanPredictor:
         mask = active_mask(universe, state.universe_size)
         if state.min_periods is not None:
             mask &= state.pool.counts >= state.min_periods
-        mask &= np.isfinite(current).all(axis=1)
+        mask &= valid_rows(current)
 
         out = np.full(universe.shape[0], np.nan)
         if mask.any():
