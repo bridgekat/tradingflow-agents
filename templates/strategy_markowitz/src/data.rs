@@ -31,8 +31,6 @@ use tradingflow::{
     time::UnixTime,
 };
 
-use crate::args::Args;
-
 /// The symbol table read from `symbol_list.parquet`.
 pub struct SymbolList {
     /// Stock symbols, sorted — the cross-section axis.
@@ -151,13 +149,11 @@ impl MarketData {
 /// Loads the long-format Parquet panels and wire the cross-sectional fields.
 pub fn build_market_data(
     b: &mut Builder<Instant, UnixTime>,
+    data_dir: &str,
+    data_start: Option<Instant>,
+    data_end: Option<Instant>,
     symbols: &[String],
-    args: &Args,
 ) -> MarketData {
-    let dir = &args.data_dir;
-    let start = args.data_start();
-    let end = args.end;
-
     // Whole-market axis: the schema must cover every label its table carries.
     let schema = Schema::new(symbols);
 
@@ -181,15 +177,15 @@ pub fn build_market_data(
     let mut fields = BTreeMap::new();
     let mut row_signals = BTreeMap::new();
     for (kind, prefix) in PANELS {
-        let names = read_value_columns(&format!("{dir}/{kind}.parquet"));
+        let names = read_value_columns(&format!("{data_dir}/{kind}.parquet"));
         let (signals, values) = b.source(
             panel::parquet(
-                format!("{dir}/{kind}.parquet"),
+                format!("{data_dir}/{kind}.parquet"),
                 "date",
                 [("symbol".into(), Axis::Labeled(schema.clone()))],
                 names.clone(),
             )
-            .with_time_range(start, end),
+            .with_time_range(data_start, data_end),
         );
         row_signals.insert(kind.to_string(), signals);
         for (name, &handle) in names.iter().zip(values.iter()) {
@@ -198,19 +194,22 @@ pub fn build_market_data(
                 _ => format!("{prefix}.{name}"),
             };
             let prev = fields.insert(key, handle);
-            assert!(prev.is_none(), "{dir}/{kind}.parquet: duplicate field key");
+            assert!(
+                prev.is_none(),
+                "{data_dir}/{kind}.parquet: duplicate field key"
+            );
         }
     }
 
     let field = |name: &str| -> ArrayPortHandle<f64, 1> {
         *fields
             .get(name)
-            .unwrap_or_else(|| panic!("{dir}: no field {name:?} in the Parquet panels"))
+            .unwrap_or_else(|| panic!("{data_dir}: no field {name:?} in the Parquet panels"))
     };
     let signals = |kind: &str| -> SignalPortHandle<1> {
         *row_signals
             .get(kind)
-            .unwrap_or_else(|| panic!("{dir}: no panel file {kind}.parquet"))
+            .unwrap_or_else(|| panic!("{data_dir}: no panel file {kind}.parquet"))
     };
     let price_signals = signals("daily_prices");
     let div_signals = signals("dividends");

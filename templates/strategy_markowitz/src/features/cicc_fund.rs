@@ -90,7 +90,7 @@ use tradingflow::{
     time::UnixTime,
 };
 
-use super::basic::{YEAR, annualized, change, growth, parent_equity, ttm};
+use super::common::{YEAR, annualized, change, growth, parent_equity, ttm};
 use crate::data::MarketData;
 
 /// Builds the CICC fundamental catalog, returning one `(name, ranked value)`

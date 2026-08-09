@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 use tradingflow::{data::Instant, graph::Graph, ports::SeriesPortHandle, time::UnixTime};
 
-use crate::args::format_date;
+use crate::utils::format_date;
 
 /// Trading days per year, for annualizing the daily statistics.
 const DAYS_PER_YEAR: f64 = 252.0;

@@ -1,16 +1,14 @@
 use tradingflow::{
     data::{Duration, Instant, Retention},
     graph::Builder,
-    operators::{elem, feature, rolling, stats},
+    operators::{elem, feature, rolling},
     ports::{ArrayPortHandle, SignalPortHandle},
     time::UnixTime,
 };
 
 use crate::data::MarketData;
 
-/// Retention window lengths for month / quarter / year.
-const MONTH: Retention = Retention::duration(Duration::from_days(30));
-const QUARTER: Retention = Retention::duration(Duration::from_days(90));
+/// The one-year retention window of the TTM and year-over-year helpers.
 pub const YEAR: Retention = Retention::duration(Duration::from_days(365));
 
 /// Annualized (YTD → per-year) report flow named `name`, gated per element by
@@ -84,53 +82,4 @@ pub fn growth(
     level: ArrayPortHandle<f64, 1>,
 ) -> ArrayPortHandle<f64, 1> {
     b.op(rolling::pct_change(YEAR), (daily, level))
-}
-
-/// The baseline feature catalog: a small hand-written set of `(name, raw
-/// value)` entries, one per feature, not yet imputed.
-pub fn build_features_basic(
-    b: &mut Builder<Instant, UnixTime>,
-    m: &MarketData,
-) -> Vec<(String, ArrayPortHandle<f64, 1>)> {
-    let mut features = Vec::new();
-    let mut add = |name: &str, h: ArrayPortHandle<f64, 1>| {
-        features.push((name.to_string(), h));
-    };
-    let daily = m.daily;
-
-    // Shared building blocks (computed once, reused by several features).
-    let market_cap = b.op(elem::mul(), (m.close, m.field("shares.total")));
-    let net_profit = annualized(b, m, m.income_report_signals, "income_statement.profit");
-    let np_ttm = ttm(b, m.daily, net_profit);
-    let parent_equity = parent_equity(b, m);
-
-    // ---- Momentum & reversal ----
-    let rev_1m = b.op(rolling::diff(MONTH), (daily, m.log_adj)); // trailing 1-month log return
-    add("REV_1M", rev_1m);
-    let mom_12m = b.op(rolling::diff(YEAR), (daily, m.log_adj));
-    add("MOM_12M", b.op(elem::sub(), (mom_12m, rev_1m))); // 12-month minus most recent month
-
-    // ---- Volatility ----
-    let vol_3m = b.op(rolling::std_dev(QUARTER, 0), (daily, m.log_return));
-    add("VOL_3M", vol_3m);
-
-    // ---- Size ----
-    let ln_mc = b.op(elem::ln(), market_cap);
-    add("Ln_MC", ln_mc);
-
-    // ---- Valuation ----
-    // The fundamentals' cross-sections are heavy-tailed ratios, so the rank
-    // transform is part of their definition: percentile to `[0, 1]`, with a
-    // missing value staying `NaN` for the finalizer's mean imputation (the
-    // neutral median `0.5`).
-    let bp = b.op(elem::div(), (parent_equity, market_cap)); // 净资产 / 总市值
-    add("BP_LR", b.op(stats::percentile(), bp));
-    let ep = b.op(elem::div(), (np_ttm, market_cap)); // 净利润 TTM / 总市值
-    add("EP_TTM", b.op(stats::percentile(), ep));
-
-    // ---- Liquidity ----
-    let turnover = b.op(elem::div(), (m.volume, m.field("shares.circulating"))); // daily 换手率
-    add("TURN_1M", b.op(rolling::mean(MONTH, 0), (daily, turnover)));
-
-    features
 }

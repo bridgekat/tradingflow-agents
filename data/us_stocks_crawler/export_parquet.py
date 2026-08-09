@@ -208,9 +208,7 @@ def prepare_report(
         report_year = report_date.dt.year
         report_day = report_date.dt.dayofyear
 
-    lag = pd.to_timedelta(
-        np.where(is_annual, annual_lag_days, quarterly_lag_days), unit="D"
-    )
+    lag = pd.to_timedelta(np.where(is_annual, annual_lag_days, quarterly_lag_days), unit="D")
     deadline = report_date + lag
     usable = notice_date.notna() & (notice_date <= deadline)
     effective = np.where(usable, np.maximum(report_date, notice_date), deadline)
@@ -244,9 +242,7 @@ def prepare_report(
     out["report_year"] = report_year.astype(np.int32)
     out["report_day_of_year"] = report_day.astype(np.int32)
     passthrough = ("date", "notice_date", "start_date")
-    out = pd.concat(
-        [out] + [df[c] for c in df.columns if c not in passthrough], axis=1
-    )
+    out = pd.concat([out] + [df[c] for c in df.columns if c not in passthrough], axis=1)
     if "start_date" in df.columns:
         out.insert(2, "start_date", df["start_date"])
     return out[keep.to_numpy()]

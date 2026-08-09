@@ -1,9 +1,10 @@
 [package]
-name = "strategy_markowitz"
+name = "backtests"
 version = "0.1.0"
 edition = "2024"
 
-[workspace]
+[lib]
+crate-type = ["lib"]
 
 [dependencies]
 tradingflow = { path = "../../tradingflow/crates/tradingflow", features = [
