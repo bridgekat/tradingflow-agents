@@ -188,7 +188,7 @@ async fn main() {
 
     // Start the embedded interpreter as the repository's virtual environment,
     // with the strategy-local operators resolvable by `py_operator_module`.
-    python::initialize();
+    python::initialize(&args.python_ops_dir);
 
     // Print run parameters.
     println!("data dir: \"{}\"", args.data_dir);

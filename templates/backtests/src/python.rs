@@ -36,7 +36,7 @@ static START: Once = Once::new();
 ///
 /// Exits the process if CPython cannot start, the only thing a failed
 /// interpreter startup permits — there is no interpreter left to raise with.
-pub fn initialize() {
+pub fn initialize(python_ops_dir: &str) {
     START.call_once(|| {
         // SAFETY: `Py_IsInitialized` is callable without an interpreter — that
         // is the question it answers.
@@ -51,11 +51,9 @@ pub fn initialize() {
         // performs the default startup.
         Python::initialize();
 
-        let code = std::ffi::CString::new(format!(
-            "import sys; sys.path.append({:?})",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/python"),
-        ))
-        .unwrap();
+        let code =
+            std::ffi::CString::new(format!("import sys; sys.path.append({:?})", python_ops_dir,))
+                .unwrap();
         Python::attach(|py| py.run(&code, None, None).expect("cannot extend sys.path"));
     });
 }
