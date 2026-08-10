@@ -82,21 +82,25 @@ class FactorModelRegressor:
     def add_cross_section(self, mask: np.ndarray, b: np.ndarray, r: np.ndarray) -> None:
         """Adds a cross-section of `(b[mask], r[mask])` to the accumulator."""
 
+        bm, rm = b[mask], r[mask]
         assert mask.shape == (self.n,) and mask.dtype == np.bool_
-        assert b.shape == (self.n, self.k) and np.isfinite(b[mask]).all()
-        assert r.shape == (self.n,) and np.isfinite(r[mask]).all()
+        assert b.shape == (self.n, self.k) and np.isfinite(bm).all()
+        assert r.shape == (self.n,) and np.isfinite(rm).all()
+
+        if not mask.any():
+            return
 
         try:
-            pinv = np.linalg.pinv(b[mask])  # (Bᵀ B)⁻¹ Bᵀ
+            pinv = np.linalg.pinv(bm, rcond=1e-6)  # (Bᵀ B)⁻¹ Bᵀ
         except np.linalg.LinAlgError:
             print("risk_model: SVD did not converge", file=sys.stderr)
             return
 
-        f = pinv @ r[mask]
-        q = np.einsum("ij,ji->i", b[mask], pinv)  # leverage: diagonal of B (Bᵀ B)⁻¹ Bᵀ
+        f = pinv @ rm
+        q = np.einsum("ij,ji->i", bm, pinv)  # leverage: diagonal of B (Bᵀ B)⁻¹ Bᵀ
         outer = np.outer(f, f)
         resid = np.zeros((self.n,))
-        resid[mask] = np.square(b[mask] @ f - r[mask]) / np.maximum(1.0 - q, 1e-3)
+        resid[mask] = np.square(bm @ f - rm) / np.maximum(1.0 - q, 1e-6)
 
         self.count += 1
         self.sum_outer = self.sum_outer * self.outer_lambda + outer

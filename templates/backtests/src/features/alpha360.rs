@@ -22,7 +22,7 @@
 //!
 //! * `CLOSE0` is `1` wherever the stock traded, and `VOLUME0` is `1` up to the
 //!   `1e-12` guard. Both survive into the panel for faithfulness;
-//!   [`winsorize_impute`](super::winsorize_impute) passes them through as
+//!   [`normalize`](super::common::normalize) passes them through as
 //!   (near-)constant columns.
 //! * `OPEN0`, `HIGH0`, `LOW0` and `VWAP0` are the same name *and* the same
 //!   expression as four of [Alpha158](super::alpha158)'s, which is why

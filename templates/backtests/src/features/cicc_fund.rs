@@ -26,7 +26,7 @@
 //! Every factor is a report-derived ratio whose cross-section is heavy-tailed
 //! (denominators pass through zero), so the rank transform is part of each
 //! definition: the catalog returns cross-sectional `[0, 1]` percentiles, for
-//! which the [`winsorize_impute`](super::winsorize_impute) finalizer is
+//! which the [`normalize`](super::common::normalize) finalizer is
 //! benign.
 //!
 //! # Deviations from the handbook, beyond spelling

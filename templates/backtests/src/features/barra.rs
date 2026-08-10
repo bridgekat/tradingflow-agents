@@ -1,7 +1,7 @@
-//! The BARRA-style risk factor catalog: the classic style descriptors of
+//! The Barra-style risk factor catalog: the classic style descriptors of
 //! Barra CNE5 / USE4, one raw entry per descriptor, for the covariance
 //! predictor to regress realized returns on. The country intercept and the
-//! industry dummy columns that complete a BARRA exposure matrix live outside
+//! industry dummy columns that complete a Barra exposure matrix live outside
 //! this catalog — see [`build_features`](super::build_features) and the
 //! [`industry`](super::industry) set.
 //!

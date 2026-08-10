@@ -191,6 +191,9 @@ class SlottedMarkowitzSolver:
         count = active.sum()
         if count > m:
             raise ValueError(f"portfolio: {count} active stocks exceed universe size {m}")
+        if count == 0:
+            print("portfolio: no active stocks to solve", file=sys.stderr)
+            return None  # avoid infeasible problem, e.g. full position with no stocks
 
         self.update_mask(active)
         max_ = self.slot_mask.astype(np.float64)

@@ -1,5 +1,8 @@
-//! NAV readout: summary statistics, the wide CSV the plot scripts read, and
-//! the long-format weights CSV written alongside it.
+//! Backtest readouts: the NAV summary statistics and the wide CSV the plot
+//! scripts read ([`ReportTable`]), the long-format weights CSV written
+//! alongside it ([`WeightsTable`]), and the per-feature diagnostics
+//! ([`FeatureTable`]) — for now each feature's cumulative information
+//! coefficient and the statistics of the IC series behind it.
 
 use std::fmt::Write as _;
 use tradingflow::{data::Instant, graph::Graph, ports::SeriesPortHandle, time::UnixTime};
@@ -8,6 +11,29 @@ use crate::utils::format_date;
 
 /// Trading days per year, for annualizing the daily statistics.
 const DAYS_PER_YEAR: f64 = 252.0;
+
+/// Write a `date,<label>,...` wide CSV: one row per instant, one column per
+/// labelled series (each as long as `instants`). `what` names the rows in the
+/// line printed afterwards.
+fn write_wide_csv(path: &str, instants: &[Instant], columns: &[(&str, &[f64])], what: &str) {
+    let mut csv = String::from("date");
+    for (label, _) in columns {
+        write!(csv, ",{label}").unwrap();
+    }
+    csv.push('\n');
+    for (i, &t) in instants.iter().enumerate() {
+        write!(csv, "{}", format_date(t)).unwrap();
+        for (_, values) in columns {
+            write!(csv, ",{}", values[i]).unwrap();
+        }
+        csv.push('\n');
+    }
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, csv).unwrap_or_else(|e| panic!("write {path}: {e}"));
+    println!("wrote {} {what} to {path}", instants.len());
+}
 
 /// Summary statistics of a daily NAV curve.
 pub struct ReportStats {
@@ -106,23 +132,159 @@ impl ReportTable {
 
     /// Write the accumulated columns as `date,<label>,...` CSV.
     pub fn write(&self, path: &str) {
-        let mut csv = String::from("date");
-        for (label, _) in &self.columns {
-            write!(csv, ",{label}").unwrap();
+        let columns: Vec<(&str, &[f64])> = self
+            .columns
+            .iter()
+            .map(|(label, values)| (label.as_str(), values.as_slice()))
+            .collect();
+        write_wide_csv(path, &self.instants, &columns, "NAV points");
+    }
+}
+
+/// Summary statistics of one feature's daily information-coefficient (IC)
+/// series — currently the whole of what [`FeatureTable`] scores a feature on.
+pub struct FeatureStats {
+    /// Finite daily observations: the days whose cross-section had enough
+    /// pairwise-valid symbols to correlate at all.
+    pub count: usize,
+    /// Mean IC over those observations — the feature's average per-day
+    /// cross-sectional correlation with the next day's return.
+    pub mean: f64,
+    /// Sample standard deviation of the IC: how much that edge wobbles.
+    pub std: f64,
+    /// `mean / std`: the per-day information ratio of the IC.
+    pub icir: f64,
+    /// `icir * sqrt(count)`: the t-statistic against a mean IC of zero.
+    pub t_stat: f64,
+    /// Share of the observations whose IC is positive.
+    pub positive: f64,
+    /// Final cumulative IC — the sum of the finite observations, i.e. the last
+    /// point of the curve [`FeatureTable`] writes.
+    pub cumulative: f64,
+}
+
+/// Statistics of a daily IC series over its finite entries; the dispersion
+/// ratios are `NaN` for a series with fewer than two of them, and everything
+/// but `cumulative` is `NaN` for one with none.
+pub fn feature_stats(values: &[f64]) -> FeatureStats {
+    let s: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
+    let count = s.len();
+    let cumulative: f64 = s.iter().sum();
+    let mean = cumulative / count as f64; // `NaN` when nothing is finite
+    let positive = s.iter().filter(|&&x| x > 0.0).count() as f64 / count as f64;
+    if count < 2 {
+        return FeatureStats {
+            count,
+            mean,
+            std: f64::NAN,
+            icir: f64::NAN,
+            t_stat: f64::NAN,
+            positive,
+            cumulative,
+        };
+    }
+    let var = s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (count - 1) as f64;
+    let std = var.sqrt();
+    let icir = if std > 0.0 { mean / std } else { f64::NAN };
+    FeatureStats {
+        count,
+        mean,
+        std,
+        icir,
+        t_stat: icir * (count as f64).sqrt(),
+        positive,
+        cumulative,
+    }
+}
+
+/// Accumulates the per-feature diagnostics: today each feature's cumulative
+/// IC curve and the [`FeatureStats`] of the IC series behind it. All the IC
+/// series are recorded on the same daily pulse, so they share one date axis.
+///
+/// The curve is the running sum of the daily ICs: a feature that predicts the
+/// next day's cross-section with a stable edge climbs steadily, one with no
+/// edge wanders around zero, and the slope at any point is the local mean IC.
+/// A day the feature could not be scored (too few pairwise-valid symbols, so
+/// the IC is `NaN` — typically the warm-up before its windows fill) carries
+/// the curve flat rather than breaking it, which keeps the summed edge
+/// comparable across features that start at different dates. It also means a
+/// flat segment reads as "not scored", not as "scored zero"; the `n` column of
+/// the printed summary is how many days actually counted.
+#[derive(Default)]
+pub struct FeatureTable {
+    instants: Vec<Instant>,
+    /// `(label, statistics, cumulative curve)`, in insertion order.
+    columns: Vec<(String, FeatureStats, Vec<f64>)>,
+}
+
+impl FeatureTable {
+    /// Read a feature's recorded daily IC series, add its cumulative curve as
+    /// a column and keep its statistics for [`print`](Self::print).
+    pub fn add(
+        &mut self,
+        g: &Graph<Instant, UnixTime>,
+        label: impl Into<String>,
+        ic: SeriesPortHandle<f64, 0>,
+    ) {
+        let label = label.into();
+        let series = g.view(ic);
+        let (instants, values) = (series.instants(), series.to_contiguous());
+        if self.columns.is_empty() {
+            self.instants = instants.to_vec();
+        } else {
+            assert_eq!(self.instants.len(), instants.len(), "misaligned IC curves");
         }
-        csv.push('\n');
-        for (i, &t) in self.instants.iter().enumerate() {
-            write!(csv, "{}", format_date(t)).unwrap();
-            for (_, values) in &self.columns {
-                write!(csv, ",{}", values[i]).unwrap();
-            }
-            csv.push('\n');
+        let stats = feature_stats(&values);
+        let mut sum = 0.0;
+        let curve = values
+            .iter()
+            .map(|v| {
+                if v.is_finite() {
+                    sum += v;
+                }
+                sum
+            })
+            .collect();
+        self.columns.push((label, stats, curve));
+    }
+
+    /// Print one summary line per feature, strongest mean IC first. A feature
+    /// that was never scored sorts last, whatever its `NaN` statistics compare
+    /// as.
+    pub fn print(&self) {
+        let mut order: Vec<&(String, FeatureStats, Vec<f64>)> = self.columns.iter().collect();
+        let key = |s: &FeatureStats| match s.mean.is_finite() {
+            true => s.mean.abs(),
+            false => f64::NEG_INFINITY,
+        };
+        order.sort_by(|a, b| key(&b.1).total_cmp(&key(&a.1)));
+        println!(
+            "{:<28}{:>7}{:>10}{:>9}{:>8}{:>8}{:>8}{:>9}",
+            "feature", "n", "mean IC", "std", "ICIR", "t", "pos", "cum IC",
+        );
+        for (label, s, _) in order {
+            println!(
+                "{label:<28}{:>7}{:>+10.4}{:>9.4}{:>+8.3}{:>+8.2}{:>7.1}%{:>+9.2}",
+                s.count,
+                s.mean,
+                s.std,
+                s.icir,
+                s.t_stat,
+                s.positive * 100.0,
+                s.cumulative,
+            );
         }
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(path, csv).unwrap_or_else(|e| panic!("write {path}: {e}"));
-        println!("wrote {} NAV points to {path}", self.instants.len());
+    }
+
+    /// Write the accumulated cumulative IC curves as `date,<label>,...` CSV,
+    /// the columns in the order the features were added.
+    pub fn write(&self, path: &str) {
+        let columns: Vec<(&str, &[f64])> = self
+            .columns
+            .iter()
+            .map(|(label, _, curve)| (label.as_str(), curve.as_slice()))
+            .collect();
+        write_wide_csv(path, &self.instants, &columns, "cumulative IC points");
     }
 }
 

@@ -1,9 +1,8 @@
-//! A miniature factor model strategy, using Python operators.
+//! A baseline factor model strategy.
 //!
-//! The strategy reads the same CSV panels as the MACD example, and does the
-//! following:
+//! The strategy does the following:
 //!
-//! 1. Calculate a few simple features from the price and volume series.
+//! 1. Calculate selected features from the price and volume series.
 //! 2. Feed the features and past returns into a mean predictor
 //!    (the "alpha model") to obtain a cross-sectional vector of expected
 //!    future returns.
@@ -23,9 +22,15 @@
 //! releases the Python GIL during backend solves (although it makes little
 //! difference on the small example dataset).
 //!
-//! This example requires an embedded Python interpreter with NumPy, SciPy
-//! and CVXPY; see the repository README for details. `OPENBLAS_NUM_THREADS=1`
-//! is required if NumPy is linked against OpenBLAS.
+//! This backtest requires an embedded Python interpreter with NumPy, SciPy
+//! and CVXPY. The build script automatically discovers the active virtual
+//! environment, and `python::initialize()` sets up the interpreter to act
+//! like the one in the discovered virtual environment. Therefore, it suffices
+//! to install dependencies in the virtual environment, and run `cargo run`
+//! with it active.
+//!
+//! The environment variable `OPENBLAS_NUM_THREADS=1` is required if NumPy
+//! is linked against OpenBLAS (which is common).
 
 use clap::Parser;
 use indicatif::ProgressBar;
@@ -42,7 +47,7 @@ use tradingflow::{
 
 use backtests::{data, features, python, quotes, report, universe, utils};
 
-/// A miniature factor model strategy, using Python operators.
+/// A baseline factor model strategy.
 #[derive(Parser)]
 struct Args {
     /// Directory containing the data CSV files.
@@ -55,7 +60,7 @@ struct Args {
 
     /// Path of the NAV curve CSV to write: one column per sweep variant,
     /// plus the cap-weighted index.
-    #[arg(long, default_value = "strategy_basic.csv")]
+    #[arg(long, default_value = "strategy.csv")]
     output: String,
 
     /// Portfolio weights below this threshold are trimmed from the weights
@@ -261,10 +266,6 @@ async fn main() {
     let (flags, bids, asks) =
         quotes::build_quotes(&mut b, m.price_signals, m.field("prices.close"));
 
-    // Prediction targets.
-    let returns = b.op(rolling::pct_change(1), (daily, m.adj_close));
-    let returns_demeaned = b.op(stats::demean(), returns);
-
     // The cap-weighted index portfolio for baseline.
     let (_positions, _cash, index_nav) = b.op(
         trader::fixed::benchmark(true, args.initial_cash),
@@ -275,6 +276,10 @@ async fn main() {
         ),
     );
     let index_nav_series = b.op(series::record_all(), (daily, index_nav));
+
+    // Prediction targets.
+    let returns = b.op(rolling::pct_change(1), (daily, m.adj_close));
+    let returns_demeaned = b.op(stats::demean(), returns);
 
     // The mean predictor (alpha model).
     //
