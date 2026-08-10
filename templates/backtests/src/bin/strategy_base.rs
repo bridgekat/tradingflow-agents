@@ -47,6 +47,35 @@ use tradingflow::{
 
 use backtests::{data, features, python, quotes, report, universe, utils};
 
+/// The selectable mean predictors (`--alpha-model`).
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum AlphaModelKind {
+    /// The incremental factor model (`alpha_models.factor_model`): regresses
+    /// returns on the alpha feature panel cross-sectionally.
+    FactorModel,
+}
+
+/// The selectable covariance predictors (`--risk-model`).
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RiskModelKind {
+    /// The incremental factor model (`risk_models.factor_model`): regresses
+    /// returns on the risk feature panel cross-sectionally.
+    FactorModel,
+    /// The shrinkage estimator (`risk_models.shrinkage`): a sample
+    /// covariance over the last `--risk-window` samples, shrunk towards its
+    /// diagonal and truncated to its top `--risk-rank` eigenpairs; ignores
+    /// the risk feature panel.
+    Shrinkage,
+}
+
+/// The selectable portfolio optimizers (`--portfolio`).
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum PortfolioKind {
+    /// The Markowitz mean-variance optimizer (`portfolio.markowitz_cvxpy`):
+    /// maximizes `expected returns - risk aversion * variance of returns`.
+    MarkowitzCvxpy,
+}
+
 /// A baseline factor model strategy.
 #[derive(Parser)]
 struct Args {
@@ -117,6 +146,10 @@ struct Args {
     #[arg(long, default_value_t = 120)]
     min_periods: usize,
 
+    /// The mean predictor feeding the optimizer.
+    #[arg(long, value_enum, default_value = "factor-model")]
+    alpha_model: AlphaModelKind,
+
     /// Ridge regression regularization term for the alpha model.
     #[arg(long, default_value_t = 1.0)]
     ridge_l2: f64,
@@ -125,6 +158,22 @@ struct Args {
     /// the factor premiums in the alpha model.
     #[arg(long, default_value_t = 250.0)]
     premium_halflife: f64,
+
+    /// The covariance predictor feeding the optimizer.
+    #[arg(long, value_enum, default_value = "factor-model")]
+    risk_model: RiskModelKind,
+
+    /// Number of eigenpairs the shrinkage risk model keeps: its output
+    /// factor rank. Clamped to the symbol count; unused by the factor model.
+    #[arg(long, default_value_t = 20)]
+    risk_rank: usize,
+
+    /// Trading days of history the shrinkage risk model keeps: its moment
+    /// estimates run over this rolling window (which truncates the halflife
+    /// decays), and its memory is `2 × window × symbols` floats. Unused by
+    /// the factor model.
+    #[arg(long, default_value_t = 500)]
+    risk_window: usize,
 
     /// Halflife (in number of trading days) of the exponential decay for
     /// the factor covariances in the risk model.
@@ -135,6 +184,10 @@ struct Args {
     /// the specific variances in the risk model.
     #[arg(long, default_value_t = 150.0)]
     specific_halflife: f64,
+
+    /// The portfolio optimizer.
+    #[arg(long, value_enum, default_value = "markowitz-cvxpy")]
+    portfolio: PortfolioKind,
 
     /// Measure risk relative to the cap-weighted index, rather than in
     /// absolute terms.
@@ -152,15 +205,6 @@ struct Args {
 }
 
 impl Args {
-    /// The tradable universe size, parsed from the CLI value `n`,
-    /// with `0` meaning the whole market.
-    pub fn resolved_universe_size(&self, n: usize) -> usize {
-        match self.universe_size {
-            0 => n,
-            k => k,
-        }
-    }
-
     /// Where the panel sources start reading: `--start` minus the warm-up.
     pub fn data_start(&self) -> Option<Instant> {
         Some(
@@ -185,6 +229,37 @@ impl Args {
         }
         instants
     }
+
+    /// The tradable universe size, parsed from the CLI value `n`,
+    /// with `0` meaning the whole market.
+    pub fn resolved_universe_size(&self, n: usize) -> usize {
+        match self.universe_size {
+            0 => n,
+            k => k,
+        }
+    }
+
+    /// The alpha model module path, selected by `--alpha-model`.
+    pub fn alpha_module(&self) -> &'static str {
+        match self.alpha_model {
+            AlphaModelKind::FactorModel => "alpha_models.factor_model",
+        }
+    }
+
+    /// The risk model module path, selected by `--risk-model`.
+    pub fn risk_module(&self) -> &'static str {
+        match self.risk_model {
+            RiskModelKind::FactorModel => "risk_models.factor_model",
+            RiskModelKind::Shrinkage => "risk_models.shrinkage",
+        }
+    }
+
+    /// The portfolio optimizer module path, selected by `--portfolio`.
+    pub fn portfolio_module(&self) -> &'static str {
+        match self.portfolio {
+            PortfolioKind::MarkowitzCvxpy => "portfolio.markowitz_cvxpy",
+        }
+    }
 }
 
 #[tokio::main]
@@ -206,6 +281,7 @@ async fn main() {
         "data end: {}",
         args.end.map_or("(none)".to_string(), utils::format_date)
     );
+    println!("rebalance interval: {} calendar days", args.rebalance_every);
 
     // Load the complete symbol list with its industry tags.
     let data::SymbolList {
@@ -216,7 +292,7 @@ async fn main() {
     let k = args.resolved_universe_size(symbols.len());
     assert!(k >= 2, "the tradable universe needs at least 2 symbols");
 
-    println!("symbol axis: {} symbols", symbols.len(),);
+    println!("symbol axis: {} symbols", symbols.len());
     println!("tradable universe: top {k} by market cap");
     println!("risk-aversion sweep: {:?}", args.risk_aversion);
 
@@ -258,6 +334,9 @@ async fn main() {
         "risk features: {}",
         risk_features.schema.labels().join(", ")
     );
+    println!("alpha model: {}", args.alpha_module());
+    println!("risk model: {}", args.risk_module());
+    println!("portfolio optimizer: {}", args.portfolio_module());
 
     // Cap-weighted top-`k` universe weights.
     let universe = universe::build_cap_weighted_universe(&mut b, &m, rebalance, k);
@@ -295,7 +374,7 @@ async fn main() {
     type AlphaOutputs = ArrayPort<f64, 1>; // predicted returns (demeaned)
     let mu = b.op(
         py_operator_module::<AlphaInputs, AlphaOutputs>(
-            "alpha_models.factor_model",
+            args.alpha_module(),
             py_params(|d| {
                 d.set_item("universe_size", k)?;
                 d.set_item("target_offset", 1)?; // features[t] pairs with target[t + 1]
@@ -333,13 +412,17 @@ async fn main() {
     );
     let (exposures, covariance, specific) = b.op(
         py_operator_module::<RiskInputs, RiskOutputs>(
-            "risk_models.factor_model",
+            args.risk_module(),
             py_params(|d| {
                 d.set_item("universe_size", k)?;
                 d.set_item("target_offset", 1)?; // features[t] pairs with target[t + 1]
                 d.set_item("min_periods", args.min_periods)?;
                 d.set_item("covariance_halflife", args.covariance_halflife)?;
                 d.set_item("specific_halflife", args.specific_halflife)?;
+                if args.risk_model == RiskModelKind::Shrinkage {
+                    d.set_item("rank", args.risk_rank)?;
+                    d.set_item("window", args.risk_window)?;
+                }
                 Ok(())
             }),
         ),
@@ -361,7 +444,7 @@ async fn main() {
         type PortfolioOutputs = ArrayPort<f64, 1>; // portfolio weights
         let weights = b.op(
             py_operator_module::<PortfolioInputs, PortfolioOutputs>(
-                "portfolio.markowitz_cvxpy",
+                args.portfolio_module(),
                 py_params(|d| {
                     d.set_item("universe_size", k)?; // size the solver to the universe
                     d.set_item("benchmark_relative", args.benchmark_relative)?;

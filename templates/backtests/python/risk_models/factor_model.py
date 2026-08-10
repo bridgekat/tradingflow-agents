@@ -9,15 +9,19 @@ class FactorModelRegressor:
     """An incremental factor model for covariance (risk) prediction.
     It assumes the target `r` is a vector process following (at each period):
 
-        r = B f + ε
+    ```
+    r = B f + ε
+    ```
 
     for some predictable matrix process `B`, adapted vector process `f`, and
     adapted vector process `ε` with uncorrelated components (conditioned
     on past periods):
 
-        E[ε] = 0
-        Cov[ε] = diag(σ²_0, ..., σ²_{n - 1})
-        Cov[f, ε] = 0
+    ```
+    E[ε] = 0
+    Cov[ε] = diag(σ²_0, ..., σ²_{n - 1})
+    Cov[f, ε] = 0
+    ```
 
     where `σ²` is again a predictable vector process. Here we omit the
     time subscripts and other notational details: for example, `E[ε]` actually
@@ -26,7 +30,9 @@ class FactorModelRegressor:
     Each period, the matrix `B` is provided as input, and `f` is estimated by
     solving the (unregularized) least-squares problem:
 
-        min_f { ‖B f - r‖² }
+    ```
+    min_f { ‖B f - r‖² }
+    ```
 
     then `σ²` is estimated by taking exponentially-weighted moving average over
     the residual `B f - r`. Similarly, we estimate `Cov[f]` by taking
@@ -36,7 +42,9 @@ class FactorModelRegressor:
 
     The model assumptions directly leads to:
 
-        Cov[r] = B Cov[f] Bᵀ + diag(σ²_0, ..., σ²_{n - 1})
+    ```
+    Cov[r] = B Cov[f] Bᵀ + diag(σ²_0, ..., σ²_{n - 1})
+    ```
 
     produced in three components: the exposures `B`, the factor covariances
     `Cov[f]`, and the specific variances `σ²`.
@@ -47,11 +55,10 @@ class FactorModelRegressor:
     outer_lambda: float
     res_lambda: float
 
-    count: int
-    sum_outer: np.ndarray
     sum_outer_w: float
-    sum_res: np.ndarray
-    sum_res_w: np.ndarray
+    sum_outer_xw: np.ndarray
+    sum_resid_w: np.ndarray
+    sum_resid_xw: np.ndarray
 
     covariance: np.ndarray
     specific: np.ndarray
@@ -70,11 +77,10 @@ class FactorModelRegressor:
         self.outer_lambda = outer_lambda
         self.res_lambda = res_lambda
 
-        self.count = 0
-        self.sum_outer = np.zeros((k, k))
         self.sum_outer_w = 0.0
-        self.sum_res = np.zeros((n,))
-        self.sum_res_w = np.zeros((n,))
+        self.sum_outer_xw = np.zeros((k, k))
+        self.sum_resid_w = np.zeros((n,))
+        self.sum_resid_xw = np.zeros((n,))
 
         self.covariance = np.zeros((k, k))
         self.specific = np.full((n,), np.nan)
@@ -102,23 +108,24 @@ class FactorModelRegressor:
         resid = np.zeros((self.n,))
         resid[mask] = np.square(bm @ f - rm) / np.maximum(1.0 - q, 1e-6)
 
-        self.count += 1
-        self.sum_outer = self.sum_outer * self.outer_lambda + outer
         self.sum_outer_w = self.sum_outer_w * self.outer_lambda + 1.0
-        self.sum_res = self.sum_res * self.res_lambda + resid
-        self.sum_res_w = self.sum_res_w * self.res_lambda + mask.astype(np.float64)
+        self.sum_outer_xw = self.sum_outer_xw * self.outer_lambda + outer
+        self.sum_resid_w = self.sum_resid_w * self.res_lambda + mask.astype(np.float64)
+        self.sum_resid_xw = self.sum_resid_xw * self.res_lambda + resid
 
     def fit(self, mask: np.ndarray) -> None:
         """Calculates and record model parameters."""
 
-        if self.count == 0:
+        if self.sum_outer_w == 0.0:
             print("risk_model: no samples to fit", file=sys.stderr)
             return
 
-        self.covariance = self.sum_outer / self.sum_outer_w
-        self.specific[mask] = self.sum_res[mask] / self.sum_res_w[mask]
+        self.covariance = self.sum_outer_xw / self.sum_outer_w
+        self.specific[mask] = self.sum_resid_xw[mask] / self.sum_resid_w[mask]
 
-    def predict(self, mask: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def predict(
+        self, mask: np.ndarray, b: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Predicts the components of the covariance matrix."""
 
         assert mask.shape == (self.n,) and mask.dtype == np.bool_
@@ -161,7 +168,9 @@ class RiskModel:
         assert universe_size > 0, "risk_model: universe_size must be positive"
         assert target_offset >= 0, "risk_model: target_offset must be non-negative"
         assert min_periods > 0, "risk_model: min_periods must be positive"
-        assert covariance_halflife > 0.0, "risk_model: covariance_halflife must be positive"
+        assert (
+            covariance_halflife > 0.0
+        ), "risk_model: covariance_halflife must be positive"
         assert specific_halflife > 0.0, "risk_model: specific_halflife must be positive"
 
         self.universe_size = universe_size
@@ -174,6 +183,7 @@ class RiskModel:
         sample_signal, features, target, rebalance_signal, universe = inputs
         n, k = features.shape
         assert target.shape == (n,)
+        assert universe.shape == (n,)
 
         return RiskModelState(
             target_offset=self.target_offset,
@@ -200,6 +210,7 @@ class RiskModel:
         sample_signal, features, target, rebalance_signal, universe = inputs
         n, k = features.shape
         assert target.shape == (n,)
+        assert universe.shape == (n,)
 
         if sample_signal:
             state.pending.append(features)
@@ -212,9 +223,14 @@ class RiskModel:
 
         if rebalance_signal:
             # Predict `target_offset` periods ahead using the most recent features.
-            valid = np.isfinite(features).all(axis=1) & (state.count >= state.min_periods)
-            state.factor_model.fit(valid)
-            state.out_exposures, state.out_covariance, state.out_specific = state.factor_model.predict(valid, features)
+            valid = np.isfinite(features).all(axis=1) & (
+                state.count >= state.min_periods
+            )
+            mask = valid & (universe > 0.0)
+            state.factor_model.fit(mask)
+            state.out_exposures, state.out_covariance, state.out_specific = (
+                state.factor_model.predict(mask, features)
+            )
 
         return state.out_exposures, state.out_covariance, state.out_specific
 

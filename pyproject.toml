@@ -27,6 +27,3 @@ general-research = "tradingflow_agents.general_research.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tradingflow_agents"]
-
-[tool.black]
-line-length = 120

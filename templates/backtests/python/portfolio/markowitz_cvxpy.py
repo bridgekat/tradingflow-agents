@@ -9,7 +9,9 @@ class MarkowitzSolver:
     """A Markowitz mean-variance portfolio optimizer using CVXPY DPP.
     It solves the convex optimization problem:
 
-        max_w { μᵀ w - δ wᵀ Σ w }
+    ```
+    max_w { μᵀ w - δ wᵀ Σ w }
+    ```
 
     where `Σ = X F Xᵀ + D`, `F` is symmetric positive semi-definite, `X` is
     (narrow) rectangular, and `D` is diagonal with non-negative entries.
@@ -47,7 +49,9 @@ class MarkowitzSolver:
         self.diag = cp.Parameter(n)
 
         constraints: list[cp.Constraint] = []
-        constraints.append(cp.abs(self.w) <= self.max)  # max position size & active mask
+        constraints.append(
+            cp.abs(self.w) <= self.max
+        )  # max position size & active mask
         constraints.append(cp.norm1(self.w) <= 1.0)  # no leverage
         if long_only:
             constraints.append(self.w >= 0.0)  # no short-selling
@@ -57,11 +61,15 @@ class MarkowitzSolver:
         if benchmark_relative:
             active_w = self.w - self.bench
             active_returns = self.mu.T @ active_w
-            tracking_error = cp.sum_squares(self.rank.T @ active_w) + cp.sum_squares(cp.multiply(self.diag, active_w))
+            tracking_error = cp.sum_squares(self.rank.T @ active_w) + cp.sum_squares(
+                cp.multiply(self.diag, active_w)
+            )
             objective = cp.Maximize(active_returns - risk_aversion * tracking_error)
         else:
             returns = self.mu.T @ self.w
-            variance = cp.sum_squares(self.rank.T @ self.w) + cp.sum_squares(cp.multiply(self.diag, self.w))
+            variance = cp.sum_squares(self.rank.T @ self.w) + cp.sum_squares(
+                cp.multiply(self.diag, self.w)
+            )
             objective = cp.Maximize(returns - risk_aversion * variance)
 
         self.problem = cp.Problem(objective, constraints)
@@ -84,7 +92,12 @@ class MarkowitzSolver:
         assert covariance.shape == (self.k, self.k) and np.isfinite(covariance).all()
         assert specific.shape == (self.n,) and np.isfinite(specific).all()
 
-        lam, s = np.linalg.eigh(covariance)  # F = S Λ S⁻¹ = S Λ Sᵀ
+        try:
+            lam, s = np.linalg.eigh(covariance)  # F = S Λ S⁻¹ = S Λ Sᵀ
+        except np.linalg.LinAlgError:
+            print("portfolio: eigendecomposition did not converge", file=sys.stderr)
+            return None
+
         rank = exposures @ s @ np.diag(np.sqrt(np.maximum(lam, 0.0)))
         diag = np.sqrt(np.maximum(specific, 0.0))
 
@@ -115,7 +128,7 @@ class SlottedMarkowitzSolver:
     scatters their moments into the fixed-size problem parameters —
     an unoccupied slot keeps `max = 0`, masking it out of the solve —
     and scatters the slot weights back onto the full axis. Keeping a
-    continuing stock in the same slot across calls is what lets CVXPY's
+    continuing stock in the same slot across calls is what lets CVXPY/SCS
     cached primal-dual warm-start stay aligned across rebalances, so the
     solve benefits from the previous solution instead of restarting cold.
     """
@@ -166,7 +179,9 @@ class SlottedMarkowitzSolver:
         new_slot_mask[kept_indices] = True
 
         (free_list,) = np.nonzero(~new_slot_mask)
-        alloc_indices = new_indices[new_indices_alloc] = free_list[: new_indices_alloc.sum()]
+        alloc_indices = new_indices[new_indices_alloc] = free_list[
+            : new_indices_alloc.sum()
+        ]
         new_slot_mask[alloc_indices] = True
 
         self.global_mask = new_global_mask
@@ -175,7 +190,7 @@ class SlottedMarkowitzSolver:
 
     def solve(
         self,
-        active: np.ndarray,
+        mask: np.ndarray,
         bench: np.ndarray,
         mu: np.ndarray,
         exposures: np.ndarray,  # X
@@ -188,14 +203,16 @@ class SlottedMarkowitzSolver:
         """
 
         m, k = self.inner.n, self.inner.k
-        count = active.sum()
+        count = mask.sum()
         if count > m:
-            raise ValueError(f"portfolio: {count} active stocks exceed universe size {m}")
+            raise ValueError(
+                f"portfolio: {count} active stocks exceed universe size {m}"
+            )
         if count == 0:
             print("portfolio: no active stocks to solve", file=sys.stderr)
             return None  # avoid infeasible problem, e.g. full position with no stocks
 
-        self.update_mask(active)
+        self.update_mask(mask)
         max_ = self.slot_mask.astype(np.float64)
         bench_ = np.zeros((m,))
         bench_[self.indices] = bench[self.global_mask]
@@ -229,7 +246,9 @@ class PortfolioState:
 
 
 class Portfolio:
-    type Inputs = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+    type Inputs = tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+    ]
     type Outputs = np.ndarray
     type Context = int
     type State = PortfolioState
@@ -286,8 +305,15 @@ class Portfolio:
         assert specific.shape == (n,)
 
         if rebalance_signal:
-            valid = (universe > 0.0) & np.isfinite(mu) & np.isfinite(exposures).all(axis=1) & np.isfinite(specific)
-            weights = state.solver.solve(valid, universe, mu, exposures, covariance, specific)
+            valid = (
+                np.isfinite(mu)
+                & np.isfinite(exposures).all(axis=1)
+                & np.isfinite(specific)
+            )
+            mask = valid & (universe > 0.0)
+            weights = state.solver.solve(
+                mask, universe, mu, exposures, covariance, specific
+            )
             if weights is not None:
                 state.out_weights = weights
 
