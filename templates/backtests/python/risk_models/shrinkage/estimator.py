@@ -3,6 +3,8 @@ import sys
 import numpy as np
 import scipy.sparse.linalg
 
+from .target import Target
+
 
 @dataclass(slots=True)
 class ShrinkageEstimator:
@@ -19,8 +21,7 @@ class ShrinkageEstimator:
     random matrix `T` is some chosen shrinkage target, and `δ ∈ [0, 1]` is
     some chosen shrinkage intensity.
 
-    For now, we take `T` to be the diagonal of `S`. Shrinking towards `T` keeps
-    the sample variances, only the correlations are shrunk towards zero.
+    # The sample covariance
 
     The matrix `S` is first estimated by taking exponentially-weighted moving
     average over the outer product `r rᵀ`, and over the last `window`
@@ -36,20 +37,48 @@ class ShrinkageEstimator:
     > decay; the correlations between stock returns are slower-moving and
     > noisier, so a slower decay is preferable.
 
+    # The shrinkage target
+
+    Four classical shrinkage targets `T` are available, written via the sample
+    correlations `ρ` and refined standard deviations `σ` defined above:
+
+    - `diagonal`: `T := diag(σ²)` - correlations shrink towards zero,
+      per-asset variances are kept.
+    - `constant-correlation` (Ledoit-Wolf 2004): `T := r̄ σ σᵀ` off the
+      diagonal, `σ²` on the diagonal, with `r̄` the mean off-diagonal sample
+      correlation - correlations shrink towards their common mean, variances
+      are kept.
+    - `common-covariance` (Schäfer-Strimmer target C): `T := c̄` off the
+      diagonal, `v̄` on the diagonal, the mean sample covariance and mean
+      sample variance - everything shrinks towards its cross-sectional mean.
+    - `single-index` (Ledoit-Wolf 2003): `T := (q σ) (q σ)ᵀ` off the
+      diagonal, `σ²` on the diagonal, with `q` the asset-market sample
+      correlations - correlations shrink towards a one-factor market model,
+      variances are kept.
+
+    Every target is rank-one plus diagonal and positive semi-definite, so
+    applying one never requires a dense `n × n` matrix.
+
+    # The shrinkage intensity
+
     When no fixed intensity is given, `δ` is estimated from the data,
     following Schäfer & Strimmer: the ratio of the total estimation variance
-    of the off-diagonal correlations `ρ` to their total squared magnitude,
+    of the off-diagonal correlations `ρ` to their total squared distance
+    from the target's correlations `R`,
 
     ```
-    δ* = Σ_{i≠j} Var[ρ_ij] / Σ_{i≠j} ρ²_ij
+    δ* = Σ_{i≠j} Var[ρ_ij] / Σ_{i≠j} (ρ_ij - R_ij)²
     ```
 
     clamped to `[0, 1]`. Here `Var[ρ_ij]` is estimated as well: larger means
     more uncertainty and noise, which shrinks `S` harder towards `T`.
     As the sample grows, `Var[ρ_ij]` decreases and `δ*` converges to 0.
 
+    # The low-rank approximation
+
     Finally, the shrunk estimate `Σ*` is truncated to a specified `rank`,
-    preserving only the largest positive eigenpairs. This reduces the burden
+    preserving only the largest positive eigenpairs. The diagonal is then
+    corrected to preserve the per-asset variances. This reduces the burden
     of downstream Markowitz optimization, while also putting the covariance
     matrix into a factor-model form `Σ* = X F Xᵀ + D`. This approximation
     preserves per-asset variances; correlations beyond the kept eigenpairs
@@ -67,6 +96,7 @@ class ShrinkageEstimator:
     window: int
     outer_lambda: float
     var_lambda: float
+    target: Target
     intensity: float | None
 
     # Ring buffer of the last `window` cross-sections. `buf_pos` is the next
@@ -87,6 +117,7 @@ class ShrinkageEstimator:
         window: int,
         outer_lambda: float,
         var_lambda: float,
+        target: Target,
         intensity: float | None,
     ) -> None:
         """Initializes the shrinkage estimator for `n` assets over a rolling
@@ -98,6 +129,7 @@ class ShrinkageEstimator:
         self.window = window
         self.outer_lambda = outer_lambda
         self.var_lambda = var_lambda
+        self.target = target
         self.intensity = intensity
 
         self.buf_len = 0
@@ -148,10 +180,6 @@ class ShrinkageEstimator:
         outer_ds = np.pow(self.outer_lambda, ages)
         var_ds = np.pow(self.var_lambda, ages)
 
-        # We have `count := Σ w wᵀ` and `ssd := Σ r rᵀ` where sums are over `t`.
-        # Apply decay to get weighted sums `Σ d w wᵀ` and `Σ d r rᵀ`.
-        hrs = np.sqrt(outer_ds)[:, None] * rs  # `d r rᵀ = (√d r) (√d r)ᵀ`
-
         # The pairwise-complete weighted sample covariance estimator is
         # `S := Σ d r rᵀ / Σ d w wᵀ`. However, this matrix is not necessarily
         # positive semi-definite and harder to work with, so we instead use
@@ -175,89 +203,37 @@ class ShrinkageEstimator:
         # But it can correct itself: as time passes, if the correlation
         # persists, the geometric-mean correlation will converge to 1 as well,
         # and exponential weighting makes this faster.
+        hrs = np.sqrt(outer_ds)[:, None] * rs  # `√d r`
         norm_hrs = np.linalg.norm(hrs, axis=0)
         us = hrs / np.where(norm_hrs > 0.0, norm_hrs, 1.0)  # `u = normalize(√d r)`
 
-        # `is_narrow` marks the small regime where `m × m` products are cheaper
-        # than their `window × window` or matrix-free counterparts.
-        is_narrow = m <= max(t, 512) or 4 * min(self.rank, m) >= m
-
-        if self.intensity is not None:
-            delta = self.intensity
-        else:
-            # For shrinkage intensity, we assume that `r rᵀ` is i.i.d. across
-            # `t`, and use weighted sample means to estimate its mean and
-            # variance:
-            #
-            # - `E[r_i r_j] ≈ Σ d (r_i r_j) / Σ d`
-            # - `Var[r_i r_j] ≈ Σ d² (r_i r_j - E[r_i r_j])² / Σ d²`
-            #
-            # Using these, we derive an estimator for `Var[ρ_ij]`:
-            #
-            # ```
-            # Var[ρ_ij]
-            # = Var[Σ u_i u_j]
-            # = Var[Σ d r_i r_j / √(Σ d r²_i) √(Σ d r²_j)]
-            # ≈ Var[Σ d r_i r_j] / (Σ d r²_i) (Σ d r²_j)    (delta method omitting cross-terms!)
-            # = (Σ d²) Var[r_i r_j] / (Σ d r²_i) (Σ d r²_j)    (i.i.d. assumption)
-            # ≈ Σ d² (r_i r_j - E[r_i r_j])² / (Σ d r²_i) (Σ d r²_j)    (variance estimator)
-            # ≈ Σ d² (r_i r_j - Σ d (r_i r_j) / Σ d)² / (Σ d r²_i) (Σ d r²_j)    (mean estimator)
-            # = Σ (u_i u_j - ρ_ij · d / Σ d)²    (rewrites)
-            # ```
-            #
-            # In matrix notation, the matrix of variances is
-            # `Var[ρ] ≈ Σ (u uᵀ - ρ · d / Σ d)² = Σ (A - 2 B + C)`, where:
-            #
-            # - `A := Σ (u uᵀ)² = Σ u² u²ᵀ`
-            # - `B := Σ (u uᵀ) · ρ · d / Σ d = ρ · Σ (u uᵀ) · d / Σ d`
-            # - `C := Σ (ρ · d / Σ d)² = ρ² · Σ (d / Σ d)²`
-            #
-            # The numerator of shrinkage intensity is then obtained by
-            # left- and right-multiplying `Var[ρ]` by the all-ones vector, then
-            # subtracting the trace. The denominator is similarly obtained from
-            # `ρ²`. The intensity is then clamped to `[0, 1]`.
-            u2s = np.square(us)
-            rho_diag = u2s.sum(axis=0)
-            ds_unit = outer_ds / outer_ds.sum()  # `d / Σ d`
-            ds_unit_ss = np.square(ds_unit).sum()  # `Σ (d / Σ d)²`
-            a = np.square(u2s.sum(axis=1)).sum()  # sum over `A`
-            a_diag = np.square(u2s).sum()  # diagonal sum over `A`
-            b_diag = np.dot(ds_unit @ u2s, rho_diag)  # diagonal sum over `B`
-            d_diag = np.square(rho_diag).sum()  # diagonal sum over `ρ²`
-            c_diag = d_diag * ds_unit_ss  # diagonal sum over `C`
-
-            # Summation over `B` and `ρ²` both require summation of the shape
-            # `Σ_stij u_si u_sj u_ti u_tj`, which can be done in either
-            # `O(m² t)` or `O(t² m)` depending on which axis is smaller.
-            if is_narrow:
-                rho = us.T @ us
-                b = (rho * (us.T @ (us * ds_unit[:, None]))).sum()  # sum over `B`
-                d = np.square(rho).sum()  # sum over `ρ²`
-                c = d * ds_unit_ss  # sum over `C`
-            else:
-                g2 = np.square(us @ us.T)
-                b = (g2 @ ds_unit).sum()  # sum over `B`
-                d = g2.sum()  # sum over `ρ²`
-                c = d * ds_unit_ss  # sum over `C`
-
-            num = (a - a_diag) - 2.0 * (b - b_diag) + (c - c_diag)
-            denom = d - d_diag
-            delta = np.clip(num / (denom if denom > 0.0 else 1.0), 0.0, 1.0)
-
         # Per-asset variances under their own (faster) decay refine the
-        # diagonal: `Σ* = (1 - δ) ρ · (σ σᵀ) + δ diag(σ²)`.
+        # variance component: `Σ* = (1 - δ) ρ · (σ σᵀ) + δ diag(σ²)`.
         dws = var_ds @ ws
         dr2s = var_ds @ np.square(rs)
         sigma2 = dr2s / np.where(dws > 0.0, dws, 1.0)
         sigma = np.sqrt(sigma2)
 
+        # Build the shrinkage target and compute the shrinkage intensity.
+        self.target.build(outer_ds, ws, us, sigma)
+        sigma2_target = self.target.diag()
+
+        if self.intensity is not None:
+            delta = self.intensity
+        else:
+            delta = self.target.intensity(outer_ds, ws, us, sigma)
+
         # Truncate the shrunk covariance matrix to the specified rank.
         k = min(self.rank, m)
-        if is_narrow:
+
+        # Dispatch on the size and rank of the problem: if the requested rank
+        # is large enough, use dense eigendecomposition; otherwise, use sparse
+        # eigendecomposition.
+        if 4 * k >= m:
             try:
-                shrunk = (1.0 - delta) * ((us.T @ us) * np.outer(sigma, sigma))
-                shrunk[np.diag_indices(m)] += delta * sigma2
-                lam, vec = np.linalg.eigh(shrunk)  # ascending eigenvalues
+                cov = (us.T @ us) * np.outer(sigma, sigma)
+                target = self.target.dense()
+                lam, vec = np.linalg.eigh((1.0 - delta) * cov + delta * target)
                 lam, vec = lam[-k:], vec[:, -k:]
 
             except np.linalg.LinAlgError:
@@ -273,9 +249,9 @@ class ShrinkageEstimator:
                 # `Σ* z = (1 - δ) σ · Uᵀ U (σ · z) + δ σ² · z`, each
                 # `O(t m)` right-to-left.
                 def matvec(z: np.ndarray) -> np.ndarray:
-                    shrunk = sigma * (us.T @ (us @ (sigma * z)))
-                    target = sigma2 * z
-                    return (1.0 - delta) * shrunk + delta * target
+                    cov = sigma * (us.T @ (us @ (sigma * z)))
+                    target = self.target.matvec(z)
+                    return (1.0 - delta) * cov + delta * target
 
                 # Create the matrix-free linear operator for `Σ*`.
                 op = scipy.sparse.linalg.LinearOperator(
@@ -303,9 +279,10 @@ class ShrinkageEstimator:
         self.covariance[:kept, :kept] = np.diag(lam[:kept])
 
         # The diagonal left unexplained by the kept eigenpairs becomes the
-        # specific variance, preserving per-asset variances.
+        # specific variance, preserving the diagonal of the shrunk matrix.
+        sigma2_shrunk = (1.0 - delta) * sigma2 + delta * sigma2_target
         sigma2_kept = np.square(vec[:, :kept]) @ lam[:kept]
-        self.specific[mask] = np.maximum(sigma2 - sigma2_kept, 0.0)
+        self.specific[mask] = np.maximum(sigma2_shrunk - sigma2_kept, 0.0)
 
     def predict(
         self, mask: np.ndarray, b: np.ndarray
@@ -315,113 +292,3 @@ class ShrinkageEstimator:
         assert mask.shape == (self.n,) and mask.dtype == np.bool_
 
         return self.exposures, self.covariance, self.specific
-
-
-@dataclass(slots=True)
-class RiskModelState:
-    target_offset: int
-    min_periods: int
-
-    count: np.ndarray
-    estimator: ShrinkageEstimator
-
-    # Output covariance matrix is `Σ = X F Xᵀ + D`:
-    out_exposures: np.ndarray  # X
-    out_covariance: np.ndarray  # F
-    out_specific: np.ndarray  # diagonal of D
-
-
-class RiskModel:
-    type Inputs = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
-    type Outputs = tuple[np.ndarray, np.ndarray, np.ndarray]
-    type Context = int
-    type State = RiskModelState
-
-    def __init__(
-        self,
-        universe_size: int,
-        target_offset: int,
-        min_periods: int,
-        covariance_halflife: float,
-        specific_halflife: float,
-        rank: int,
-        window: int,
-        shrinkage: float | None = None,
-    ) -> None:
-        assert universe_size > 0, "risk_model: universe_size must be positive"
-        assert target_offset >= 0, "risk_model: target_offset must be non-negative"
-        assert min_periods > 0, "risk_model: min_periods must be positive"
-        assert (
-            covariance_halflife > 0.0
-        ), "risk_model: covariance_halflife must be positive"
-        assert specific_halflife > 0.0, "risk_model: specific_halflife must be positive"
-        assert rank > 0, "risk_model: rank must be positive"
-        assert window > 0, "risk_model: window must be positive"
-        assert (
-            shrinkage is None or 0.0 <= shrinkage <= 1.0
-        ), "risk_model: shrinkage must be in [0, 1]"
-
-        self.universe_size = universe_size
-        self.target_offset = target_offset
-        self.min_periods = min_periods
-        self.covariance_halflife = covariance_halflife
-        self.specific_halflife = specific_halflife
-        self.rank = rank
-        self.window = window
-        self.shrinkage = shrinkage
-
-    def init(self, inputs: Inputs) -> State:
-        sample_signal, features, target, rebalance_signal, universe = inputs
-        n, k = features.shape
-        assert target.shape == (n,)
-        assert universe.shape == (n,)
-
-        rank = min(self.rank, n)
-        return RiskModelState(
-            target_offset=self.target_offset,
-            min_periods=self.min_periods,
-            count=np.zeros((n,), dtype=np.int32),
-            estimator=ShrinkageEstimator(
-                n=n,
-                rank=rank,
-                window=self.window,
-                outer_lambda=np.exp2(-1.0 / self.covariance_halflife),
-                var_lambda=np.exp2(-1.0 / self.specific_halflife),
-                intensity=self.shrinkage,
-            ),
-            out_exposures=np.zeros((n, rank)),
-            out_covariance=np.eye(rank),
-            out_specific=np.full((n,), np.nan),
-        )
-
-    @staticmethod
-    def reset(_: Inputs, state: State) -> Outputs:
-        return state.out_exposures, state.out_covariance, state.out_specific
-
-    @staticmethod
-    def compute(inputs: Inputs, state: State, _: Context) -> Outputs:
-        sample_signal, features, target, rebalance_signal, universe = inputs
-        n, k = features.shape
-        assert target.shape == (n,)
-        assert universe.shape == (n,)
-
-        if sample_signal:
-            # Adds one cross-section to the training set.
-            valid = np.isfinite(target)
-            state.count += valid.astype(np.int32)
-            state.estimator.add_cross_section(valid, target)
-
-        if rebalance_signal:
-            # Predict any periods ahead.
-            valid = state.count >= state.min_periods
-            mask = valid & (universe > 0.0)
-            state.estimator.fit(mask)
-            state.out_exposures, state.out_covariance, state.out_specific = (
-                state.estimator.predict(mask, features)
-            )
-
-        return state.out_exposures, state.out_covariance, state.out_specific
-
-
-def build(**kwargs) -> RiskModel:
-    return RiskModel(**kwargs)

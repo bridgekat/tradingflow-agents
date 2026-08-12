@@ -62,10 +62,29 @@ enum RiskModelKind {
     /// returns on the risk feature panel cross-sectionally.
     FactorModel,
     /// The shrinkage estimator (`risk_models.shrinkage`): a sample
-    /// covariance over the last `--risk-window` samples, shrunk towards its
-    /// diagonal and truncated to its top `--risk-rank` eigenpairs; ignores
-    /// the risk feature panel.
+    /// covariance over the last `--risk-window` samples, shrunk towards
+    /// `--risk-shrinkage-target` and truncated to its top `--risk-rank`
+    /// eigenpairs; ignores the risk feature panel.
     Shrinkage,
+}
+
+/// The selectable targets of the shrinkage risk model
+/// (`--risk-shrinkage-target`).
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum RiskShrinkageTargetKind {
+    /// The diagonal of the sample covariance: correlations shrink towards
+    /// zero, per-asset variances are kept.
+    Diagonal,
+    /// Constant correlation (Ledoit-Wolf 2004): correlations shrink towards
+    /// their cross-sectional mean, variances are kept.
+    ConstantCorrelation,
+    /// Common covariance (Schäfer-Strimmer target C): correlations and
+    /// variances all shrink towards their cross-sectional means.
+    CommonCovariance,
+    /// Single index (Ledoit-Wolf 2003): correlations shrink towards a
+    /// one-factor market model, with the market taken as the equal-weighted
+    /// portfolio of standardized returns; variances are kept.
+    SingleIndex,
 }
 
 /// The selectable portfolio optimizers (`--portfolio`).
@@ -175,6 +194,11 @@ struct Args {
     #[arg(long, default_value_t = 500)]
     risk_window: usize,
 
+    /// The shrinkage target of the shrinkage risk model. Unused by the
+    /// factor model.
+    #[arg(long, value_enum, default_value = "constant-correlation")]
+    risk_shrinkage_target: RiskShrinkageTargetKind,
+
     /// Halflife (in number of trading days) of the exponential decay for
     /// the factor covariances in the risk model.
     #[arg(long, default_value_t = 250.0)]
@@ -251,6 +275,17 @@ impl Args {
         match self.risk_model {
             RiskModelKind::FactorModel => "risk_models.factor_model",
             RiskModelKind::Shrinkage => "risk_models.shrinkage",
+        }
+    }
+
+    /// The shrinkage target name passed to the shrinkage risk model,
+    /// selected by `--risk-shrinkage-target`.
+    pub fn risk_shrinkage_target_name(&self) -> &'static str {
+        match self.risk_shrinkage_target {
+            RiskShrinkageTargetKind::Diagonal => "diagonal",
+            RiskShrinkageTargetKind::ConstantCorrelation => "constant-correlation",
+            RiskShrinkageTargetKind::CommonCovariance => "common-covariance",
+            RiskShrinkageTargetKind::SingleIndex => "single-index",
         }
     }
 
@@ -422,6 +457,7 @@ async fn main() {
                 if args.risk_model == RiskModelKind::Shrinkage {
                     d.set_item("rank", args.risk_rank)?;
                     d.set_item("window", args.risk_window)?;
+                    d.set_item("target", args.risk_shrinkage_target_name())?;
                 }
                 Ok(())
             }),
