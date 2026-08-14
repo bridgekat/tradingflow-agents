@@ -234,7 +234,13 @@ pub fn build_features(
     let (names, raw): (Vec<_>, Vec<_>) = entries.into_iter().unzip();
     let features: Vec<_> = raw.into_iter().map(|h| normalize(b, h)).collect();
 
-    let panel = b.op(array::stack(1), &features[..]);
+    // `stack` needs at least one view; an empty selection (e.g. a backtest
+    // that only evaluates risk models) still gets a well-formed `(N, 0)`
+    // panel.
+    let panel = match features.is_empty() {
+        true => b.val(array::constant(Array::full([m.n, 0], 0.0))),
+        false => b.op(array::stack(1), &features[..]),
+    };
     let alpha = Features {
         schema: Schema::new(names),
         panel,

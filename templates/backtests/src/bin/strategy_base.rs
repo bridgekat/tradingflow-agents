@@ -68,31 +68,12 @@ enum RiskModelKind {
     Shrinkage,
 }
 
-/// The selectable targets of the shrinkage risk model
-/// (`--risk-shrinkage-target`).
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum RiskShrinkageTargetKind {
-    /// The diagonal of the sample covariance: correlations shrink towards
-    /// zero, per-asset variances are kept.
-    Diagonal,
-    /// Constant correlation (Ledoit-Wolf 2004): correlations shrink towards
-    /// their cross-sectional mean, variances are kept.
-    ConstantCorrelation,
-    /// Common covariance (Schäfer-Strimmer target C): correlations and
-    /// variances all shrink towards their cross-sectional means.
-    CommonCovariance,
-    /// Single index (Ledoit-Wolf 2003): correlations shrink towards a
-    /// one-factor market model, with the market taken as the equal-weighted
-    /// portfolio of standardized returns; variances are kept.
-    SingleIndex,
-}
-
 /// The selectable portfolio optimizers (`--portfolio`).
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum PortfolioKind {
-    /// The Markowitz mean-variance optimizer (`portfolio.markowitz_cvxpy`):
+    /// The Markowitz mean-variance optimizer (`portfolio.mean_variance`):
     /// maximizes `expected returns - risk aversion * variance of returns`.
-    MarkowitzCvxpy,
+    MeanVariance,
 }
 
 /// A baseline factor model strategy.
@@ -194,11 +175,6 @@ struct Args {
     #[arg(long, default_value_t = 500)]
     risk_window: usize,
 
-    /// The shrinkage target of the shrinkage risk model. Unused by the
-    /// factor model.
-    #[arg(long, value_enum, default_value = "constant-correlation")]
-    risk_shrinkage_target: RiskShrinkageTargetKind,
-
     /// Halflife (in number of trading days) of the exponential decay for
     /// the factor covariances in the risk model.
     #[arg(long, default_value_t = 250.0)]
@@ -210,7 +186,7 @@ struct Args {
     specific_halflife: f64,
 
     /// The portfolio optimizer.
-    #[arg(long, value_enum, default_value = "markowitz-cvxpy")]
+    #[arg(long, value_enum, default_value = "mean-variance")]
     portfolio: PortfolioKind,
 
     /// Measure risk relative to the cap-weighted index, rather than in
@@ -278,21 +254,10 @@ impl Args {
         }
     }
 
-    /// The shrinkage target name passed to the shrinkage risk model,
-    /// selected by `--risk-shrinkage-target`.
-    pub fn risk_shrinkage_target_name(&self) -> &'static str {
-        match self.risk_shrinkage_target {
-            RiskShrinkageTargetKind::Diagonal => "diagonal",
-            RiskShrinkageTargetKind::ConstantCorrelation => "constant-correlation",
-            RiskShrinkageTargetKind::CommonCovariance => "common-covariance",
-            RiskShrinkageTargetKind::SingleIndex => "single-index",
-        }
-    }
-
     /// The portfolio optimizer module path, selected by `--portfolio`.
     pub fn portfolio_module(&self) -> &'static str {
         match self.portfolio {
-            PortfolioKind::MarkowitzCvxpy => "portfolio.markowitz_cvxpy",
+            PortfolioKind::MeanVariance => "portfolio.mean_variance",
         }
     }
 }
@@ -457,7 +422,6 @@ async fn main() {
                 if args.risk_model == RiskModelKind::Shrinkage {
                     d.set_item("rank", args.risk_rank)?;
                     d.set_item("window", args.risk_window)?;
-                    d.set_item("target", args.risk_shrinkage_target_name())?;
                 }
                 Ok(())
             }),

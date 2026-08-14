@@ -119,6 +119,35 @@ def _clip_intensity(noise: float, distance: float) -> float:
 
 
 @dataclass(slots=True)
+class TargetNone(Target):
+    """The zero shrinkage target `T = 0` at default intensity `δ = 0`, so
+    the estimate is the sample covariance matrix itself unless an explicit
+    intensity is set.
+    """
+
+    size: int = 0
+
+    def intensity(
+        self, ds: np.ndarray, ws: np.ndarray, us: np.ndarray, sigma: np.ndarray
+    ) -> float:
+        return 0.0
+
+    def build(
+        self, ds: np.ndarray, ws: np.ndarray, us: np.ndarray, sigma: np.ndarray
+    ) -> None:
+        self.size = sigma.size
+
+    def dense(self) -> np.ndarray:
+        return np.zeros((self.size, self.size))
+
+    def diag(self) -> np.ndarray:
+        return np.zeros((self.size,))
+
+    def matvec(self, x: np.ndarray) -> np.ndarray:
+        return np.zeros_like(x)
+
+
+@dataclass(slots=True)
 class TargetDiagonal(Target):
     """A shrinkage target that is the diagonal of the sample covariance matrix
     `S`, preserving per-asset variances while shrinking correlations to 0.
@@ -303,6 +332,7 @@ class TargetSingleIndex(Target):
 
 
 SHRINKAGE_TARGETS: dict[str, type[Target]] = {
+    "none": TargetNone,
     "diagonal": TargetDiagonal,
     "constant-correlation": TargetConstantCorrelation,
     "common-covariance": TargetCommonCovariance,

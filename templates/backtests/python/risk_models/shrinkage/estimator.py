@@ -76,13 +76,26 @@ class ShrinkageEstimator:
 
     # The low-rank approximation
 
-    Finally, the shrunk estimate `Σ*` is truncated to a specified `rank`,
+    Finally, the shrunk estimate `Σ*` is truncated to a specified rank `k`,
     preserving only the largest positive eigenpairs. The diagonal is then
     corrected to preserve the per-asset variances. This reduces the burden
     of downstream Markowitz optimization, while also putting the covariance
     matrix into a factor-model form `Σ* = X F Xᵀ + D`. This approximation
     preserves per-asset variances; correlations beyond the kept eigenpairs
     are lost.
+
+    The truncation is a regularizer itself: the matrix is effectively shrunk
+    towards the nearest rank-`k` target, at intensity 1. Unlike `δ`, it is
+    not optional: the downstream optimizer needs a small `k` to function
+    (DPP canonicalization can produce an `O(k² m)` problem), and with
+    `n ≫ t` the trailing eigenpairs are noise anyway. Empirically, at `k = 20`
+    the sample covariance and every shrunk variant land within a few percent
+    of each other in realized GMV portfolio risk, and the classic result that
+    the sample covariance performs badly near `t ≈ m` unless shrunk
+    (Pantaleo et al. 2011) no longer apply - truncation has already removed
+    the small-eigenvalue directions that estimation error lives in. The two
+    therefore substitute for each other rather than compose: `δ` earns its
+    keep at high `k`, and redundant at low `k`.
 
     > The whole process is implemented matrix-free whenever possible, never
     > forming the full `n × n` matrices (where `n` is the number of assets).

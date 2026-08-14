@@ -1,8 +1,10 @@
 //! Backtest readouts: the NAV summary statistics and the wide CSV the plot
 //! scripts read ([`ReportTable`]), the long-format weights CSV written
-//! alongside it ([`WeightsTable`]), and the per-feature diagnostics
+//! alongside it ([`WeightsTable`]), the per-feature diagnostics
 //! ([`FeatureTable`]) — for now each feature's cumulative information
-//! coefficient and the statistics of the IC series behind it.
+//! coefficient and the statistics of the IC series behind it — and the
+//! per-risk-model diagnostics ([`RiskModelTable`]): the daily metric series
+//! recorded from the risk-model scoring operators and their summary statistics.
 
 use std::fmt::Write as _;
 use tradingflow::{data::Instant, graph::Graph, ports::SeriesPortHandle, time::UnixTime};
@@ -285,6 +287,216 @@ impl FeatureTable {
             .map(|(label, _, curve)| (label.as_str(), curve.as_slice()))
             .collect();
         write_wide_csv(path, &self.instants, &columns, "cumulative IC points");
+    }
+}
+
+/// The daily metric series a risk model is scored on, in recording order.
+pub const RISK_MODEL_METRICS: [&str; 7] = [
+    "log_likelihood",
+    "gmv_return",
+    "gmv_variance",
+    "mean_correlation",
+    "factor_share",
+    "gmv_breadth",
+    "gmv_short_share",
+];
+
+/// Summary statistics of one risk model's daily metric series.
+pub struct RiskModelStats {
+    /// Days on which the GMV portfolio was scored (finite return and
+    /// positive predicted variance).
+    pub days: usize,
+    /// Mean per-asset Gaussian log-likelihood of the realized cross-sections
+    /// under the predicted covariances. Higher is better.
+    pub mean_log_likelihood: f64,
+    /// Annualized realized volatility of the GMV portfolio built from the
+    /// predicted covariances. Lower is better: minimizing this is exactly
+    /// what the covariance forecast is for.
+    pub realized_vol: f64,
+    /// Annualized predicted volatility of the same portfolio (the mean of
+    /// the model's own per-period forecasts).
+    pub predicted_vol: f64,
+    /// Standard deviation of the GMV returns standardized by their
+    /// predicted volatility. Ideal is 1: above 1 the model under-forecasts
+    /// its own portfolio's risk, below 1 it over-forecasts.
+    pub bias_ratio: f64,
+    /// Mean predicted off-diagonal correlation across the scored days.
+    pub mean_correlation: f64,
+    /// Mean share of predicted variance carried by the factors.
+    pub factor_share: f64,
+    /// Mean effective number of GMV holdings, `1 / Σ w²`.
+    pub gmv_breadth: f64,
+    /// Mean share of the GMV book's gross exposure carried by its short
+    /// leg, `Σ max(-wᵢ, 0) / Σ |wᵢ|`.
+    pub gmv_short_share: f64,
+}
+
+/// Mean of the finite entries; `NaN` when there are none.
+fn finite_mean(xs: &[f64]) -> f64 {
+    let s: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
+    s.iter().sum::<f64>() / s.len() as f64
+}
+
+/// Statistics from the daily metric series (columns in the order of
+/// [`RISK_MODEL_METRICS`]); the volatility and bias numbers are `NaN` with
+/// fewer than 10 scored days.
+pub fn risk_model_stats(columns: &[Vec<f64>]) -> RiskModelStats {
+    let mean_log_likelihood = finite_mean(&columns[0]);
+    let mean_correlation = finite_mean(&columns[3]);
+    let factor_share = finite_mean(&columns[4]);
+    let gmv_breadth = finite_mean(&columns[5]);
+    let gmv_short_share = finite_mean(&columns[6]);
+
+    let scored: Vec<(f64, f64)> = columns[1]
+        .iter()
+        .zip(&columns[2])
+        .filter(|(r, v)| r.is_finite() && v.is_finite() && **v > 0.0)
+        .map(|(&r, &v)| (r, v))
+        .collect();
+    let days = scored.len();
+    if days < 10 {
+        return RiskModelStats {
+            days,
+            mean_log_likelihood,
+            realized_vol: f64::NAN,
+            predicted_vol: f64::NAN,
+            bias_ratio: f64::NAN,
+            mean_correlation,
+            factor_share,
+            gmv_breadth,
+            gmv_short_share,
+        };
+    }
+
+    let sample_std = |xs: &[f64]| {
+        let mean = xs.iter().sum::<f64>() / xs.len() as f64;
+        (xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (xs.len() - 1) as f64).sqrt()
+    };
+    let rets: Vec<f64> = scored.iter().map(|(r, _)| *r).collect();
+    let zs: Vec<f64> = scored.iter().map(|(r, v)| r / v.sqrt()).collect();
+    let mean_pred = scored.iter().map(|(_, v)| v.sqrt()).sum::<f64>() / days as f64;
+    RiskModelStats {
+        days,
+        mean_log_likelihood,
+        realized_vol: sample_std(&rets) * DAYS_PER_YEAR.sqrt(),
+        predicted_vol: mean_pred * DAYS_PER_YEAR.sqrt(),
+        bias_ratio: sample_std(&zs),
+        mean_correlation,
+        factor_share,
+        gmv_breadth,
+        gmv_short_share,
+    }
+}
+
+/// Accumulates the per-risk-model diagnostics: the daily metric series
+/// recorded from the scoring operators (one rank-0 series per
+/// [`RISK_MODEL_METRICS`] entry) and the [`RiskModelStats`] behind them.
+/// All series are recorded on the same daily pulse, so they share one date
+/// axis.
+#[derive(Default)]
+pub struct RiskModelTable {
+    instants: Vec<Instant>,
+    /// `(label, statistics, one series per [`RISK_MODEL_METRICS`] column)`,
+    /// in insertion order.
+    columns: Vec<(String, RiskModelStats, Vec<Vec<f64>>)>,
+}
+
+impl RiskModelTable {
+    /// Read one risk model's recorded daily metric series (in the order of
+    /// [`RISK_MODEL_METRICS`]), trim the warm-up before `start`, add its
+    /// columns and keep its statistics for [`print`](Self::print).
+    pub fn add(
+        &mut self,
+        g: &Graph<Instant, UnixTime>,
+        label: impl Into<String>,
+        start: Option<Instant>,
+        hs: [SeriesPortHandle<f64, 0>; RISK_MODEL_METRICS.len()],
+    ) {
+        let label = label.into();
+        let mut columns = Vec::with_capacity(RISK_MODEL_METRICS.len());
+        for h in hs {
+            let series = g.view(h);
+            let instants = series.instants();
+            let keep = instants
+                .iter()
+                .position(|&t| start.is_none_or(|s| t >= s))
+                .unwrap_or(instants.len());
+            if self.columns.is_empty() && columns.is_empty() {
+                self.instants = instants[keep..].to_vec();
+            } else {
+                assert_eq!(
+                    self.instants.len(),
+                    instants.len() - keep,
+                    "misaligned metric series"
+                );
+            }
+            columns.push(series.to_contiguous()[keep..].to_vec());
+        }
+        let stats = risk_model_stats(&columns);
+        self.columns.push((label, stats, columns));
+    }
+
+    /// Print one summary line per risk model, highest mean log-likelihood
+    /// first. A model that was never scored sorts last, whatever its `NaN`
+    /// statistics compare as.
+    pub fn print(&self) {
+        let mut order: Vec<&(String, RiskModelStats, Vec<Vec<f64>>)> =
+            self.columns.iter().collect();
+        let key = |s: &RiskModelStats| match s.mean_log_likelihood.is_finite() {
+            true => s.mean_log_likelihood,
+            false => f64::NEG_INFINITY,
+        };
+        order.sort_by(|a, b| key(&b.1).total_cmp(&key(&a.1)));
+        println!(
+            "{:<40}{:>6}{:>11}{:>10}{:>10}{:>7}{:>8}{:>8}{:>9}{:>8}",
+            "risk model",
+            "days",
+            "logL/asset",
+            "GMV vol",
+            "GMV pred",
+            "bias",
+            "corr",
+            "factor",
+            "N_eff",
+            "short",
+        );
+        for (label, s, _) in order {
+            println!(
+                "{label:<40}{:>6}{:>+11.4}{:>9.2}%{:>9.2}%{:>7.2}{:>8.3}{:>7.0}%{:>9.0}{:>7.0}%",
+                s.days,
+                s.mean_log_likelihood,
+                s.realized_vol * 100.0,
+                s.predicted_vol * 100.0,
+                s.bias_ratio,
+                s.mean_correlation,
+                s.factor_share * 100.0,
+                s.gmv_breadth,
+                s.gmv_short_share * 100.0,
+            );
+        }
+    }
+
+    /// Write the accumulated metric series as a `date,<label>_...` wide CSV,
+    /// one column per metric per risk model, in the order the models were
+    /// added.
+    pub fn write(&self, path: &str) {
+        let labels: Vec<Vec<String>> = self
+            .columns
+            .iter()
+            .map(|(label, _, _)| {
+                RISK_MODEL_METRICS
+                    .iter()
+                    .map(|metric| format!("{label}_{metric}"))
+                    .collect()
+            })
+            .collect();
+        let mut columns: Vec<(&str, &[f64])> = Vec::new();
+        for ((_, _, series), names) in self.columns.iter().zip(&labels) {
+            for (values, name) in series.iter().zip(names) {
+                columns.push((name.as_str(), values.as_slice()));
+            }
+        }
+        write_wide_csv(path, &self.instants, &columns, "metric points");
     }
 }
 

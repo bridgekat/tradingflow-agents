@@ -5,7 +5,7 @@ import cvxpy as cp
 
 
 @dataclass(slots=True)
-class MarkowitzSolver:
+class MeanVarianceSolver:
     """A Markowitz mean-variance portfolio optimizer using CVXPY DPP.
     It solves the convex optimization problem:
 
@@ -121,10 +121,10 @@ class MarkowitzSolver:
 
 
 @dataclass(slots=True)
-class SlottedMarkowitzSolver:
+class SlottedMeanVarianceSolver:
     """Restricts a size-`n` Markowitz problem to `m` solver slots.
 
-    Wraps [`MarkowitzSolver`]: gathers the active stocks into stable slots,
+    Wraps [`MeanVarianceSolver`]: gathers the active stocks into stable slots,
     scatters their moments into the fixed-size problem parameters —
     an unoccupied slot keeps `max = 0`, masking it out of the solve —
     and scatters the slot weights back onto the full axis. Keeping a
@@ -137,7 +137,7 @@ class SlottedMarkowitzSolver:
     global_mask: np.ndarray
     slot_mask: np.ndarray
     indices: np.ndarray
-    inner: MarkowitzSolver
+    inner: MeanVarianceSolver
 
     def __init__(
         self,
@@ -156,7 +156,7 @@ class SlottedMarkowitzSolver:
         self.global_mask = np.zeros((n,), dtype=bool)
         self.slot_mask = np.zeros((m,), dtype=bool)
         self.indices = np.zeros((0,), dtype=np.intp)
-        self.inner = MarkowitzSolver(
+        self.inner = MeanVarianceSolver(
             n=m,
             k=k,
             benchmark_relative=benchmark_relative,
@@ -241,7 +241,7 @@ class SlottedMarkowitzSolver:
 
 @dataclass(slots=True)
 class PortfolioState:
-    solver: SlottedMarkowitzSolver
+    solver: SlottedMeanVarianceSolver
     out_weights: np.ndarray
 
 
@@ -279,7 +279,7 @@ class Portfolio:
         assert specific.shape == (n,)
 
         return PortfolioState(
-            solver=SlottedMarkowitzSolver(
+            solver=SlottedMeanVarianceSolver(
                 n=n,
                 m=min(self.universe_size, n),
                 k=k,

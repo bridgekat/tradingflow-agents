@@ -34,7 +34,7 @@ class RiskModel:
         specific_halflife: float,
         rank: int,
         window: int,
-        target: str = "diagonal",
+        target: str = "none",
         intensity: float | None = None,
     ) -> None:
         assert universe_size > 0, "risk_model: universe_size must be positive"
