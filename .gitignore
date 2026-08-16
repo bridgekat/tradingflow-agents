@@ -49,3 +49,4 @@ Thumbs.db
 
 # API keys and local configuration.
 .env
+runs/
