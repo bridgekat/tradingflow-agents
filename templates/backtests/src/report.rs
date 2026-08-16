@@ -1,6 +1,7 @@
-//! Backtest readouts: the NAV summary statistics and the wide CSV the plot
-//! scripts read ([`ReportTable`]), the long-format weights CSV written
-//! alongside it ([`WeightsTable`]), the per-feature diagnostics
+//! Backtest readouts: the NAV summary statistics — with the annualized
+//! turnover that explains how much of the return the fees took — and the wide
+//! CSV the plot scripts read ([`ReportTable`]), the long-format weights CSV
+//! written alongside it ([`WeightsTable`]), the per-feature diagnostics
 //! ([`FeatureTable`]) — for now each feature's cumulative information
 //! coefficient and the statistics of the IC series behind it — and the
 //! per-risk-model diagnostics ([`RiskModelTable`]): the daily metric series
@@ -37,18 +38,22 @@ fn write_wide_csv(path: &str, instants: &[Instant], columns: &[(&str, &[f64])], 
     println!("wrote {} {what} to {path}", instants.len());
 }
 
-/// Summary statistics of a daily NAV curve.
+/// Summary statistics of one portfolio: its daily NAV curve, plus the
+/// annualized turnover of the book behind it.
 pub struct ReportStats {
     pub final_value: f64,
     pub cagr: f64,
     pub sharpe: f64,
     pub vol: f64,
     pub max_drawdown: f64,
+    pub turnover: f64,
 }
 
-/// Statistics from a daily NAV series; ratios are NaN for curves with fewer
-/// than 10 finite positive samples.
-pub fn nav_stats(values: &[f64]) -> ReportStats {
+/// Statistics from a daily NAV series and the cumulative turnover curve
+/// recorded beside it; ratios are NaN for curves with fewer than 10 finite
+/// positive samples.
+pub fn report_stats(values: &[f64], turnover: &[f64]) -> ReportStats {
+    let turnover = annualized_turnover(turnover);
     let s: Vec<f64> = values
         .iter()
         .copied()
@@ -62,6 +67,7 @@ pub fn nav_stats(values: &[f64]) -> ReportStats {
             sharpe: f64::NAN,
             vol: f64::NAN,
             max_drawdown: f64::NAN,
+            turnover,
         };
     }
     let years = s.len() as f64 / DAYS_PER_YEAR;
@@ -86,29 +92,61 @@ pub fn nav_stats(values: &[f64]) -> ReportStats {
         sharpe,
         vol: std * DAYS_PER_YEAR.sqrt(),
         max_drawdown,
+        turnover,
     }
+}
+
+/// Annualized turnover from a cumulative turnover curve: everything the curve
+/// accumulated over its span, divided by that span in years. `NaN` for a curve
+/// with fewer than 10 finite samples.
+///
+/// The curve steps once per rebalance by the L1 distance between the outgoing
+/// and the incoming *target* book, so this measures intended trading rather
+/// than realized fills: it does not see the drift of held weights between
+/// rebalances, and its first step includes the one-off cost of opening the
+/// book. Read it as the lower bound it is.
+///
+/// The count is two-way — switching a fully-invested book into a disjoint one
+/// is 2.0, the sale plus the purchase — which is what lets it multiply
+/// straight into a fee estimate: at rates `buy` and `sell` the annual drag is
+/// about `turnover * (buy + sell) / 2`.
+pub fn annualized_turnover(curve: &[f64]) -> f64 {
+    let s: Vec<f64> = curve.iter().copied().filter(|x| x.is_finite()).collect();
+    if s.len() < 10 {
+        return f64::NAN;
+    }
+    let years = s.len() as f64 / DAYS_PER_YEAR;
+    (s[s.len() - 1] - s[0]) / years
 }
 
 /// Accumulates the labelled NAV columns the strategy writes to CSV. All
 /// curves are recorded on the same daily pulse, so they share one date axis.
+///
+/// Turnover is summarized alongside each NAV but deliberately kept out of the
+/// CSV: the plot scripts draw every numeric column onto one axes, where a
+/// turnover curve of a few units would be invisible against a NAV of a
+/// million.
 #[derive(Default)]
 pub struct ReportTable {
     instants: Vec<Instant>,
-    columns: Vec<(String, Vec<f64>)>,
+    /// `(label, statistics, NAV curve)`, in insertion order.
+    columns: Vec<(String, ReportStats, Vec<f64>)>,
 }
 
 impl ReportTable {
-    /// Read a recorded NAV, trim the warm-up before `start`, add it as a
-    /// column, and print its summary line.
+    /// Read a recorded NAV and the cumulative turnover curve recorded beside
+    /// it, trim the warm-up before `start`, add the NAV as a column, and print
+    /// the summary line for both.
     pub fn add(
         &mut self,
         g: &Graph<Instant, UnixTime>,
         label: impl Into<String>,
         start: Option<Instant>,
-        h: SeriesPortHandle<f64, 0>,
+        nav: SeriesPortHandle<f64, 0>,
+        turnover: SeriesPortHandle<f64, 0>,
     ) {
         let label = label.into();
-        let series = g.view(h);
+        let series = g.view(nav);
         let (instants, values) = (series.instants(), series.to_contiguous());
         let keep = instants
             .iter()
@@ -120,16 +158,28 @@ impl ReportTable {
         } else {
             assert_eq!(self.instants.len(), instants.len(), "misaligned NAV curves");
         }
-        let stats = nav_stats(values);
+
+        // The turnover curve is recorded on the same daily pulse as the NAV,
+        // so the NAV's warm-up trim applies to it unchanged.
+        let turnover = g.view(turnover);
+        assert_eq!(
+            turnover.instants().len(),
+            keep + values.len(),
+            "misaligned turnover curve"
+        );
+        let curve = turnover.to_contiguous();
+
+        let stats = report_stats(values, &curve[keep..]);
         println!(
-            "{label:>12}: final={:>12.0}  cagr={:>+6.2}%  vol={:>5.2}%  sharpe={:>6.3}  mdd={:>6.2}%",
+            "{label:>12}: final={:>12.0}  cagr={:>+6.2}%  vol={:>5.2}%  sharpe={:>6.3}  mdd={:>6.2}%  turn={:>5.2}x",
             stats.final_value,
             stats.cagr * 100.0,
             stats.vol * 100.0,
             stats.sharpe,
             stats.max_drawdown * 100.0,
+            stats.turnover,
         );
-        self.columns.push((label, values.to_vec()));
+        self.columns.push((label, stats, values.to_vec()));
     }
 
     /// Write the accumulated columns as `date,<label>,...` CSV.
@@ -137,7 +187,7 @@ impl ReportTable {
         let columns: Vec<(&str, &[f64])> = self
             .columns
             .iter()
-            .map(|(label, values)| (label.as_str(), values.as_slice()))
+            .map(|(label, _, values)| (label.as_str(), values.as_slice()))
             .collect();
         write_wide_csv(path, &self.instants, &columns, "NAV points");
     }
@@ -165,37 +215,39 @@ pub struct FeatureStats {
     pub cumulative: f64,
 }
 
-/// Statistics of a daily IC series over its finite entries; the dispersion
-/// ratios are `NaN` for a series with fewer than two of them, and everything
-/// but `cumulative` is `NaN` for one with none.
-pub fn feature_stats(values: &[f64]) -> FeatureStats {
-    let s: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
-    let count = s.len();
-    let cumulative: f64 = s.iter().sum();
-    let mean = cumulative / count as f64; // `NaN` when nothing is finite
-    let positive = s.iter().filter(|&&x| x > 0.0).count() as f64 / count as f64;
-    if count < 2 {
-        return FeatureStats {
+impl FeatureStats {
+    /// Statistics of a daily IC series over its finite entries; the dispersion
+    /// ratios are `NaN` for a series with fewer than two of them, and everything
+    /// but `cumulative` is `NaN` for one with none.
+    pub fn new(values: &[f64]) -> FeatureStats {
+        let s: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
+        let count = s.len();
+        let cumulative: f64 = s.iter().sum();
+        let mean = cumulative / count as f64; // `NaN` when nothing is finite
+        let positive = s.iter().filter(|&&x| x > 0.0).count() as f64 / count as f64;
+        if count < 2 {
+            return FeatureStats {
+                count,
+                mean,
+                std: f64::NAN,
+                icir: f64::NAN,
+                t_stat: f64::NAN,
+                positive,
+                cumulative,
+            };
+        }
+        let var = s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (count - 1) as f64;
+        let std = var.sqrt();
+        let icir = if std > 0.0 { mean / std } else { f64::NAN };
+        FeatureStats {
             count,
             mean,
-            std: f64::NAN,
-            icir: f64::NAN,
-            t_stat: f64::NAN,
+            std,
+            icir,
+            t_stat: icir * (count as f64).sqrt(),
             positive,
             cumulative,
-        };
-    }
-    let var = s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (count - 1) as f64;
-    let std = var.sqrt();
-    let icir = if std > 0.0 { mean / std } else { f64::NAN };
-    FeatureStats {
-        count,
-        mean,
-        std,
-        icir,
-        t_stat: icir * (count as f64).sqrt(),
-        positive,
-        cumulative,
+        }
     }
 }
 
@@ -236,7 +288,7 @@ impl FeatureTable {
         } else {
             assert_eq!(self.instants.len(), instants.len(), "misaligned IC curves");
         }
-        let stats = feature_stats(&values);
+        let stats = FeatureStats::new(&values);
         let mut sum = 0.0;
         let curve = values
             .iter()
@@ -330,6 +382,8 @@ pub struct RiskModelStats {
     /// leg, `Σ max(-wᵢ, 0) / Σ |wᵢ|`.
     pub gmv_short_share: f64,
 }
+
+impl RiskModelStats {}
 
 /// Mean of the finite entries; `NaN` when there are none.
 fn finite_mean(xs: &[f64]) -> f64 {
@@ -522,14 +576,19 @@ pub fn weights_path(output: &str) -> String {
 /// trimmed dust.
 #[derive(Default)]
 pub struct WeightsTable {
-    /// `(portfolio, date, symbol, weight)` rows, in write order.
-    rows: Vec<(String, Instant, String, f64)>,
+    /// `(portfolio, csv body)`, in insertion order.
+    books: Vec<(String, String)>,
 }
 
 impl WeightsTable {
-    /// Read a recorded rebalance-book series and add its rows: holdings with
-    /// `weight ≥ min_weight` (and the `CASH` residual), largest first per
-    /// date. `symbols` is the cross-section axis the book indexes.
+    /// Read a recorded rebalance-book series into one portfolio's CSV body:
+    /// holdings with `weight ≥ min_weight`, largest first per date, in
+    /// ascending date order. `symbols` is the cross-section axis the book
+    /// indexes.
+    ///
+    /// The residual `1 - Σw` is the book's cash and is not written: the
+    /// scorer infers it, and a `CASH` pseudo-symbol is not on the symbol axis
+    /// it reads the file against.
     pub fn add(
         &mut self,
         g: &Graph<Instant, UnixTime>,
@@ -543,39 +602,39 @@ impl WeightsTable {
         let label = label.into();
         let series = g.view(h);
         let instants = series.instants();
+        let mut csv = String::from("date,symbol,weight\n");
         for (k, &date) in instants.iter().enumerate() {
             let book = series.at(k).1.to_contiguous();
-            let mut sum = 0.0;
             let mut kept: Vec<(usize, f64)> = Vec::new();
             for (i, &w) in book.iter().enumerate() {
-                if w.is_finite() && w > 0.0 {
-                    sum += w;
-                    if w >= threshold {
-                        kept.push((i, w));
-                    }
+                if w.is_finite() && w >= threshold {
+                    kept.push((i, w));
                 }
             }
             kept.sort_by(|a, b| b.1.total_cmp(&a.1));
             for (i, w) in kept {
-                self.rows.push((label.clone(), date, symbols[i].clone(), w));
-            }
-            let cash = 1.0 - sum;
-            if cash >= threshold {
-                self.rows.push((label.clone(), date, "CASH".into(), cash));
+                writeln!(csv, "{},{},{w}", format_date(date), symbols[i]).unwrap();
             }
         }
+        self.books.push((label, csv));
     }
 
-    /// Write the accumulated rows as `date,portfolio,symbol,weight` CSV.
+    /// Write one `date,symbol,weight` CSV per portfolio, named
+    /// `<stem>_<label>.<ext>`, in the format `validation/score` reads.
     pub fn write(&self, path: &str) {
-        let mut csv = String::from("date,portfolio,symbol,weight\n");
-        for (portfolio, date, symbol, weight) in &self.rows {
-            writeln!(csv, "{},{portfolio},{symbol},{weight}", format_date(*date)).unwrap();
+        let p = std::path::Path::new(path);
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("weights");
+        let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("csv");
+        for (label, csv) in &self.books {
+            let path = p
+                .with_file_name(format!("{stem}_{label}.{ext}"))
+                .to_string_lossy()
+                .into_owned();
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&path, csv).unwrap_or_else(|e| panic!("write {path}: {e}"));
+            println!("wrote {} weight rows to {path}", csv.lines().count() - 1);
         }
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(path, csv).unwrap_or_else(|e| panic!("write {path}: {e}"));
-        println!("wrote {} weight rows to {path}", self.rows.len());
     }
 }

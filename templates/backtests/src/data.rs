@@ -157,26 +157,29 @@ pub fn build_market_data(
     // Whole-market axis: the schema must cover every label its table carries.
     let schema = Schema::new(symbols);
 
-    /// The panel files read, as `(file stem, field prefix)` pairs. Every value
-    /// column of a panel keys into [`MarketData::fields`] under the prefix: a
-    /// column the prefix already namespaces (`prices.close` under `prices`, or
-    /// the root field named exactly the prefix) keys as-is, anything else gets
-    /// it prepended (e.g. `income_statement.report_year`).
-    const PANELS: [(&str, &str); 6] = [
-        ("daily_prices", "prices"),
-        ("dividends", "dividends"),
-        ("equity_structures", "shares"),
-        ("balance_sheets", "balance_sheet"),
-        ("income_statements", "income_statement"),
-        ("cash_flow_statements", "cash_flow_statement"),
+    /// The panel files read, as `(file stem, field prefix, prefill)` tuples.
+    /// Every value column of a panel keys into [`MarketData::fields`] under
+    /// the prefix: a column the prefix already namespaces (`prices.close`
+    /// under `prices`, or the root field named exactly the prefix) keys as-is,
+    /// anything else gets it prepended (e.g. `income_statement.report_year`).
+    ///
+    /// All report values are prefilled: a firm's equity structure, financial
+    /// position etc. should be known immediately at data start.
+    const PANELS: [(&str, &str, bool); 6] = [
+        ("daily_prices", "prices", false),
+        ("dividends", "dividends", false),
+        ("equity_structures", "shares", true),
+        ("balance_sheets", "balance_sheet", true),
+        ("income_statements", "income_statement", true),
+        ("cash_flow_statements", "cash_flow_statement", true),
         // Unused due to low data availability.
-        // ("indirect_statements", "indirect_statement"),
+        // ("indirect_statements", "indirect_statement", true),
     ];
 
     // One panel source per file, reading every value column.
     let mut fields = BTreeMap::new();
     let mut row_signals = BTreeMap::new();
-    for (kind, prefix) in PANELS {
+    for (kind, prefix, prefill) in PANELS {
         let names = read_value_columns(&format!("{data_dir}/{kind}.parquet"));
         let (signals, values) = b.source(
             panel::parquet(
@@ -185,7 +188,8 @@ pub fn build_market_data(
                 [("symbol".into(), Axis::Labeled(schema.clone()))],
                 names.clone(),
             )
-            .with_time_range(data_start, data_end),
+            .with_time_range(data_start, data_end)
+            .with_prefill(prefill),
         );
         row_signals.insert(kind.to_string(), signals);
         for (name, &handle) in names.iter().zip(values.iter()) {
@@ -232,11 +236,15 @@ pub fn build_market_data(
     let volume = collect(b, field("prices.volume"));
     let amount = collect(b, field("prices.amount"));
 
-    // Forward adjustment for dividends, whole cross-section at once.
+    // Forward adjustment for dividends, whole cross-section at once. The close
+    // leg takes the *carried* column, which is the representation the operator
+    // documents: it gates on `price_signals` itself to tell a fresh close from
+    // a stale one, so handing it the signaled-or-NaN version would be asking it
+    // to read a `NaN` on exactly the elements it has already decided to skip.
     let (adj_multipliers, adj_close) = b.op(
         feature::forward_adjust(),
         (
-            (price_signals, close),
+            (price_signals, field("prices.close")),
             (
                 div_signals,
                 field("dividends.share"),

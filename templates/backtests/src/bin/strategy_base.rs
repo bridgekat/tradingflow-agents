@@ -12,8 +12,7 @@
 //!    a full covariance matrix of future returns.
 //! 4. Feed both the mean vector and covariance matrix components into a
 //!    mean-variance portfolio optimizer to obtain a vector of weights.
-//! 5. Simulate frictionless trading using the weights, output NAV curves
-//!    and stats.
+//! 5. Simulate trading using the weights, output NAV curves and stats.
 //!
 //! Steps 4 and 5 repeat once per `--risk-aversion` value. The whole sweep
 //! runs in a single pass over the data: the variants share the feature, alpha
@@ -38,7 +37,7 @@ use pyo3::prelude::*;
 use tradingflow::{
     data::{Duration, Instant},
     graph::{Builder, OperatorExt, Pool},
-    operators::{elem, rolling, series, stats, trader},
+    operators::{elem, metric, rolling, series, stats, trader},
     ports::{ArrayPort, SignalPort},
     python::{py_operator_module, py_params},
     sources::sync,
@@ -202,6 +201,23 @@ struct Args {
     /// Initial cash.
     #[arg(long, default_value_t = 1_000_000.0)]
     initial_cash: f64,
+
+    /// Fee charged on a buy, as a fraction of the traded amount. The default
+    /// is the commission alone.
+    #[arg(long, default_value_t = 0.0005)]
+    fee_rate_buy: f64,
+
+    /// Fee charged on a sell, as a fraction of the traded amount. The default
+    /// adds the A-share stamp duty (0.1%) to the commission.
+    #[arg(long, default_value_t = 0.0015)]
+    fee_rate_sell: f64,
+
+    /// Minimum fee per fill, in the currency of `--initial-cash`: the broker's
+    /// floor. Off by default — it binds below `--fee-min / --fee-rate-buy` of
+    /// notional, which makes the cost of a book depend on the account size
+    /// rather than on the strategy.
+    #[arg(long, default_value_t = 0.0)]
+    fee_min: f64,
 }
 
 impl Args {
@@ -254,12 +270,28 @@ impl Args {
         }
     }
 
+    /// The trader configuration, shared by the index baseline and every
+    /// sweep variant so their NAV curves are comparable. Execution is
+    /// delayed: weights computed from a rebalance date's data fill at the
+    /// next trading day's quotes.
+    pub fn trader_params(&self) -> trader::fixed::FractionalParams {
+        trader::fixed::FractionalParams {
+            delayed: true,
+            initial_cash: self.initial_cash,
+            fee_base_buy: self.fee_min,
+            fee_base_sell: self.fee_min,
+            fee_rate_buy: self.fee_rate_buy,
+            fee_rate_sell: self.fee_rate_sell,
+        }
+    }
+
     /// The portfolio optimizer module path, selected by `--portfolio`.
     pub fn portfolio_module(&self) -> &'static str {
         match self.portfolio {
             PortfolioKind::MeanVariance => "portfolio.mean_variance",
         }
     }
+
 }
 
 #[tokio::main]
@@ -282,6 +314,12 @@ async fn main() {
         args.end.map_or("(none)".to_string(), utils::format_date)
     );
     println!("rebalance interval: {} calendar days", args.rebalance_every);
+    println!(
+        "fees: buy {:.3}%, sell {:.3}%, min {} per fill",
+        args.fee_rate_buy * 100.0,
+        args.fee_rate_sell * 100.0,
+        args.fee_min,
+    );
 
     // Load the complete symbol list with its industry tags.
     let data::SymbolList {
@@ -326,14 +364,10 @@ async fn main() {
         &industries,
     );
 
-    println!(
-        "alpha features: {}",
-        alpha_features.schema.labels().join(", ")
-    );
-    println!(
-        "risk features: {}",
-        risk_features.schema.labels().join(", ")
-    );
+    let alpha_labels = alpha_features.schema.labels();
+    let risk_labels = risk_features.schema.labels();
+    println!("alpha features: {}", alpha_labels.join(", "));
+    println!("risk features: {}", risk_labels.join(", "));
     println!("alpha model: {}", args.alpha_module());
     println!("risk model: {}", args.risk_module());
     println!("portfolio optimizer: {}", args.portfolio_module());
@@ -347,7 +381,7 @@ async fn main() {
 
     // The cap-weighted index portfolio for baseline.
     let (_positions, _cash, index_nav) = b.op(
-        trader::fixed::benchmark(true, args.initial_cash),
+        trader::fixed::fractional(args.trader_params()),
         (
             (daily, flags, bids, asks),
             (m.div_signals, share_divs, cash_divs),
@@ -355,6 +389,8 @@ async fn main() {
         ),
     );
     let index_nav_series = b.op(series::record_all(), (daily, index_nav));
+    let index_turnover = b.op(metric::portfolio::turnover(), (rebalance, universe));
+    let index_turnover_series = b.op(series::record_all(), (daily, index_turnover));
 
     // Prediction targets.
     let returns = b.op(rolling::pct_change(1), (daily, m.adj_close));
@@ -463,9 +499,9 @@ async fn main() {
             weights,
         );
 
-        // Simulate frictionless trading using `weight`.
+        // Simulate trading using `weight`, net of fees.
         let (_positions, _cash, nav) = b.op(
-            trader::fixed::benchmark(true, args.initial_cash),
+            trader::fixed::fractional(args.trader_params()),
             (
                 (daily, flags, bids, asks),
                 (m.div_signals, share_divs, cash_divs),
@@ -474,7 +510,9 @@ async fn main() {
         );
         let nav_series = b.op(series::record_all(), (daily, nav));
         let book_series = b.op(series::record_all(), (rebalance, weights));
-        variants.push((risk_aversion, nav_series, book_series));
+        let turnover = b.op(metric::portfolio::turnover(), (rebalance, weights));
+        let turnover_series = b.op(series::record_all(), (daily, turnover));
+        variants.push((risk_aversion, nav_series, turnover_series, book_series));
     }
 
     // Run the event loop until all sources are exhausted, with a progress
@@ -489,10 +527,16 @@ async fn main() {
     // long-format weights CSV alongside it.
     let mut table = report::ReportTable::default();
     let mut books = report::WeightsTable::default();
-    table.add(&g, "index", Some(args.start), index_nav_series);
-    for (risk_aversion, nav, book) in variants {
+    table.add(
+        &g,
+        "index",
+        Some(args.start),
+        index_nav_series,
+        index_turnover_series,
+    );
+    for (risk_aversion, nav, turnover, book) in variants {
         let label = format!("risk_aversion_{risk_aversion}");
-        table.add(&g, label.as_str(), Some(args.start), nav);
+        table.add(&g, label.as_str(), Some(args.start), nav, turnover);
         books.add(&g, label, &symbols, args.min_weight, book);
     }
     table.write(&args.output);

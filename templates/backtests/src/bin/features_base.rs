@@ -79,10 +79,8 @@ async fn main() {
     let (alpha_features, _) =
         features::build_features(&mut b, &m, &args.alpha_feature_sets, &[], &industries);
 
-    println!(
-        "alpha features: {}",
-        alpha_features.schema.labels().join(", ")
-    );
+    let alpha_labels = alpha_features.schema.labels();
+    println!("alpha features: {}", alpha_labels.join(", "));
 
     // Prediction targets.
     let returns = b.op(rolling::pct_change(1), (daily, m.adj_close));

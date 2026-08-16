@@ -390,14 +390,12 @@ async fn main() {
     // Rebalance calendar signal.
     let rebalance = b.source(sync::signal_iter(args.rebalance_instants().into_iter()));
 
-    // Extract the risk feature panel from market data (no alpha features).
+    // Extract the risk feature panel from market data.
     let (_, risk_features) =
         features::build_features(&mut b, &m, &[], &args.risk_feature_sets, &industries);
 
-    println!(
-        "risk features: {}",
-        risk_features.schema.labels().join(", ")
-    );
+    let risk_labels = risk_features.schema.labels();
+    println!("risk features: {}", risk_labels.join(", "));
 
     // Cap-weighted top-`k` universe weights.
     let universe = universe::build_cap_weighted_universe(&mut b, &m, rebalance, k);
