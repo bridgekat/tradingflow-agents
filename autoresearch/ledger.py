@@ -36,9 +36,19 @@ never contend on a shared file.
 Usage:
 
     ledger.py submit --agent NAME --nav PATH --hypothesis TEXT --prediction TEXT
+    ledger.py note --agent NAME --finding TEXT --evidence TEXT
     ledger.py report [--agent NAME]
+    ledger.py log [--agent NAME]
     ledger.py front
     ledger.py check --ret 0.09 --vol 0.18
+
+Not every result is a point. An idea that was screened and rejected, a gain
+that turned out to be in-sample, a mechanism that explains why a whole family
+of strategies fails — these change what the next agent should try, and they
+have no (return, volatility) to record. `note` writes them to the same ledger
+so they survive the deletion of a run directory; they carry no points and so
+never touch anyone's score. `log` replays both kinds in order, which is how
+you find out what has already been tried before you try it again.
 """
 
 from __future__ import annotations
@@ -46,6 +56,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import textwrap
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -136,11 +147,21 @@ class Point:
     hypothesis: str
 
 
+def load_entries() -> list[dict]:
+    """Every ledger entry, submissions and notes alike, oldest first."""
+    entries = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(ENTRIES.glob("*.json"))
+    ]
+    entries.sort(key=lambda e: e.get("at", ""))
+    return entries
+
+
 def load_points() -> list[Point]:
     points = []
     for path in sorted(ENTRIES.glob("*.json")):
         entry = json.loads(path.read_text(encoding="utf-8"))
-        for p in entry["points"]:
+        for p in entry.get("points", []):
             points.append(
                 Point(
                     agent=entry["agent"],
@@ -237,6 +258,68 @@ def cmd_submit(args) -> None:
     _print_agent_scores(everything, highlight=args.agent)
 
 
+def cmd_note(args) -> None:
+    """Record a finding that has no points: a rejected idea, a failed
+    replication, a mechanism. Notes never affect scores."""
+    entry = {
+        "id": f"{args.agent}-note-{uuid.uuid4().hex[:8]}",
+        "agent": args.agent,
+        "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "kind": "note",
+        "finding": args.finding,
+        "evidence": args.evidence,
+        "code": args.code or "",
+        "points": [],
+    }
+    ENTRIES.mkdir(parents=True, exist_ok=True)
+    out = ENTRIES / f"{entry['id']}.json"
+    out.write_text(json.dumps(entry, indent=2) + "\n", encoding="utf-8")
+    print(f"recorded note {entry['id']} to {out.relative_to(ROOT.parent)}")
+    print("notes carry no points and do not affect your score.")
+
+
+def cmd_log(args) -> None:
+    entries = load_entries()
+    if args.agent:
+        entries = [e for e in entries if e["agent"] == args.agent]
+    if not entries:
+        print("nothing recorded yet")
+        return
+    if args.limit:
+        entries = entries[-args.limit:]
+    everything = load_points()
+
+    for e in entries:
+        when = e.get("at", "")[:16].replace("T", " ")
+        if e.get("kind") == "note" or not e.get("points"):
+            print(f"[{when}] {e['agent']} -- NOTE")
+            _print_field("finding", e.get("finding", ""))
+            _print_field("evidence", e.get("evidence", ""))
+        else:
+            pts = e["points"]
+            good = sum(
+                front_fraction((p["ret"], p["vol"]), everything) <= GOOD_THRESHOLD
+                for p in pts
+            )
+            vols = [p["vol"] for p in pts]
+            print(f"[{when}] {e['agent']} -- {len(pts)} point(s), {good} good, "
+                  f"vol {min(vols)*100:.1f}-{max(vols)*100:.1f}%")
+            _print_field("hypothesis", e.get("hypothesis", ""))
+            _print_field("prediction", e.get("prediction", ""))
+        if e.get("code"):
+            _print_field("code", e["code"])
+        print()
+
+
+def _print_field(name: str, text: str) -> None:
+    if not text:
+        return
+    body = textwrap.fill(
+        text, width=88, initial_indent="", subsequent_indent=" " * 14
+    )
+    print(f"  {name + ':':<12}{body}")
+
+
 def cmd_report(args) -> None:
     points = load_points()
     if not points:
@@ -290,13 +373,24 @@ def _print_points(rows: list[Point], everything: list[Point]) -> None:
 
 
 def _print_agent_scores(points: list[Point], highlight: str | None = None) -> None:
-    agents = sorted({p.agent for p in points})
-    print(f"{'agent':<22}{'points':>8}{'good':>7}{'score':>8}")
+    # Notes count towards nobody's score, but an agent whose whole round was a
+    # well-evidenced negative result has earned a line here all the same.
+    notes: dict[str, int] = {}
+    for e in load_entries():
+        if e.get("kind") == "note" or not e.get("points"):
+            notes[e["agent"]] = notes.get(e["agent"], 0) + 1
+
+    agents = sorted({p.agent for p in points} | set(notes))
+    print(f"{'agent':<22}{'points':>8}{'good':>7}{'score':>8}{'notes':>7}")
     for a in agents:
         mine = [p for p in points if p.agent == a]
-        good = sum(front_fraction(p, points) <= GOOD_THRESHOLD for p in mine)
+        n = f"{notes.get(a, 0):>7}" if notes.get(a) else " " * 7
         mark = "  <-- you" if a == highlight else ""
-        print(f"{a:<22}{len(mine):>8}{good:>7}{good/len(mine)*100:>7.0f}%{mark}")
+        if not mine:
+            print(f"{a:<22}{0:>8}{'-':>7}{'-':>8}{n}{mark}")
+            continue
+        good = sum(front_fraction(p, points) <= GOOD_THRESHOLD for p in mine)
+        print(f"{a:<22}{len(mine):>8}{good:>7}{good/len(mine)*100:>7.0f}%{n}{mark}")
 
 
 def main() -> None:
@@ -311,6 +405,18 @@ def main() -> None:
     s.add_argument("--code", help="path to the run directory holding the code")
     s.add_argument("--exclude", nargs="*", help="NAV columns to leave out")
     s.set_defaults(func=cmd_submit)
+
+    n = sub.add_parser("note", help="record a finding that has no points")
+    n.add_argument("--agent", required=True, help="your agent name")
+    n.add_argument("--finding", required=True, help="what you concluded, in one or two sentences")
+    n.add_argument("--evidence", required=True, help="the numbers behind it")
+    n.add_argument("--code", help="path to the run directory holding the evidence")
+    n.set_defaults(func=cmd_note)
+
+    lg = sub.add_parser("log", help="what has been tried, in order, with reasons")
+    lg.add_argument("--agent", help="only this agent's entries")
+    lg.add_argument("--limit", type=int, help="only the most recent N entries")
+    lg.set_defaults(func=cmd_log)
 
     r = sub.add_parser("report", help="the whole ledger, by band")
     r.add_argument("--agent", help="highlight this agent in the score table")
