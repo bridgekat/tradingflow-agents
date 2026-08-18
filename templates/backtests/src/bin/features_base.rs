@@ -11,12 +11,12 @@ use clap::Parser;
 use indicatif::ProgressBar;
 use tradingflow::{
     data::Instant,
-    graph::{Builder, Pool},
-    operators::{array, metric, rolling, series},
+    graph::{Builder, OperatorExt, Pool},
+    operators::{array, elem, metric, rolling, series},
     time::UnixTime,
 };
 
-use backtests::{data, features, report, utils};
+use backtests::{data, features, report, universe, utils};
 
 /// Evaluation of feature predictive power.
 #[derive(Parser)]
@@ -53,6 +53,21 @@ struct Args {
     /// Use the rank (Spearman) IC instead of the Pearson IC.
     #[arg(long)]
     rank: bool,
+
+    /// Forward-return horizon in trading days: each feature is correlated
+    /// against the next `horizon`-day return (overlapping windows when > 1,
+    /// which inflates the t-statistics — compare features, not absolutes).
+    #[arg(long, default_value_t = 1)]
+    horizon: usize,
+
+    /// Restrict the IC cross-section to the top-`k` stocks by circulating
+    /// market cap, re-selected every trading day; `0` scores the whole
+    /// market. Matches the tradable universe of `strategy_base
+    /// --universe-size k`, so the screen measures the signal where the
+    /// strategy actually trades. Membership is evaluated on the feature
+    /// date (prediction time) — no lookahead into the return day.
+    #[arg(long, default_value_t = 0)]
+    universe_size: usize,
 }
 
 #[tokio::main]
@@ -83,15 +98,38 @@ async fn main() {
     println!("alpha features: {}", alpha_labels.join(", "));
 
     // Prediction targets.
-    let returns = b.op(rolling::pct_change(1), (daily, m.adj_close));
+    let returns = b.op(rolling::pct_change(args.horizon), (daily, m.adj_close));
+
+    // Optional universe mask: 1.0 for stocks in the top-`k` by circulating
+    // cap on the day, NaN otherwise. Multiplying a feature by the mask drops
+    // out-of-universe stocks from the IC cross-section (the correlation is
+    // pairwise-complete over finite pairs).
+    let univ_mask = (args.universe_size > 0).then(|| {
+        let univ =
+            universe::build_cap_weighted_universe(&mut b, &m, daily, args.universe_size);
+        b.op(
+            elem::fill_where(|&w: &f64| w <= 0.0, f64::NAN).then(elem::signum()),
+            univ,
+        )
+    });
+    if let Some(_) = univ_mask {
+        println!(
+            "universe filter: top {} by circulating market cap (daily)",
+            args.universe_size
+        );
+    }
 
     // Calculate the information coefficient of each alpha feature: the
-    // feature is lagged a day so it is correlated against the return it
-    // could have predicted, never the one it was computed from.
+    // feature is lagged the full horizon so it is correlated against the
+    // return it could have predicted, never one it was computed from.
     let mut ic_series = Vec::new();
     for (i, name) in alpha_features.schema.labels().iter().enumerate() {
         let values = b.op(array::select_at(i, 1), alpha_features.panel);
-        let lagged = b.op(rolling::lag(1), (daily, values));
+        let values = match univ_mask {
+            Some(mask) => b.op(elem::mul(), (values, mask)),
+            None => values,
+        };
+        let lagged = b.op(rolling::lag(args.horizon), (daily, values));
         let ic = if args.rank {
             b.op(metric::feature::rank_ic(), (daily, lagged, returns))
         } else {

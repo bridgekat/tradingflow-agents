@@ -54,11 +54,14 @@ class FactorModelRegressor:
     k: int
     outer_lambda: float
     res_lambda: float
+    vol_lambda: float
 
     sum_outer_w: float
     sum_outer_xw: np.ndarray
     sum_resid_w: np.ndarray
     sum_resid_xw: np.ndarray
+    sum_vol_w: float
+    sum_vol_xw: np.ndarray
 
     covariance: np.ndarray
     specific: np.ndarray
@@ -69,18 +72,39 @@ class FactorModelRegressor:
         k: int,
         outer_lambda: float,
         res_lambda: float,
+        vol_lambda: float = 0.0,
     ) -> None:
-        """Initializes the factor model for `n` assets and `k` factors."""
+        """Initializes the factor model for `n` assets and `k` factors.
+
+        `vol_lambda`, when non-zero, runs a SECOND exponentially-weighted
+        accumulator over the same outer products `f fᵀ` at a shorter halflife.
+        Its diagonal (the factor variances) replaces the slow accumulator's
+        diagonal while the slow accumulator keeps the factor CORRELATIONS:
+
+        ```
+        F = diag(σ_fast) · R_slow · diag(σ_fast)
+        ```
+
+        The two halves of `F` are estimated with very different amounts of
+        data. A `k × k` correlation matrix needs many more observations than
+        `k` variances, so a halflife short enough to track a volatility regime
+        leaves the correlations badly conditioned; a halflife long enough to
+        condition the correlations carries a variance spike for years. Fitting
+        each at its own speed is the standard resolution.
+        """
 
         self.n = n
         self.k = k
         self.outer_lambda = outer_lambda
         self.res_lambda = res_lambda
+        self.vol_lambda = vol_lambda
 
         self.sum_outer_w = 0.0
         self.sum_outer_xw = np.zeros((k, k))
         self.sum_resid_w = np.zeros((n,))
         self.sum_resid_xw = np.zeros((n,))
+        self.sum_vol_w = 0.0
+        self.sum_vol_xw = np.zeros((k,))
 
         self.covariance = np.zeros((k, k))
         self.specific = np.full((n,), np.nan)
@@ -113,6 +137,10 @@ class FactorModelRegressor:
         self.sum_resid_w = self.sum_resid_w * self.res_lambda + mask.astype(np.float64)
         self.sum_resid_xw = self.sum_resid_xw * self.res_lambda + resid
 
+        if self.vol_lambda > 0.0:
+            self.sum_vol_w = self.sum_vol_w * self.vol_lambda + 1.0
+            self.sum_vol_xw = self.sum_vol_xw * self.vol_lambda + np.square(f)
+
     def fit(self, mask: np.ndarray) -> None:
         """Calculates and record model parameters."""
 
@@ -121,6 +149,18 @@ class FactorModelRegressor:
             return
 
         self.covariance = self.sum_outer_xw / self.sum_outer_w
+        if self.vol_lambda > 0.0 and self.sum_vol_w > 0.0:
+            # Slow correlations, fast variances: rescale the slow covariance's
+            # rows and columns so its diagonal becomes the fast accumulator's.
+            slow_var = np.diag(self.covariance)
+            fast_var = self.sum_vol_xw / self.sum_vol_w
+            ratio = np.sqrt(np.divide(
+                fast_var,
+                slow_var,
+                out=np.ones_like(fast_var),
+                where=slow_var > 0.0,
+            ))
+            self.covariance = self.covariance * np.outer(ratio, ratio)
         self.specific[mask] = self.sum_resid_xw[mask] / self.sum_resid_w[mask]
 
     def predict(
@@ -164,6 +204,7 @@ class RiskModel:
         min_periods: int,
         covariance_halflife: float,
         specific_halflife: float,
+        factor_vol_halflife: float = 0.0,
     ) -> None:
         assert universe_size > 0, "risk_model: universe_size must be positive"
         assert target_offset >= 0, "risk_model: target_offset must be non-negative"
@@ -172,12 +213,17 @@ class RiskModel:
             covariance_halflife > 0.0
         ), "risk_model: covariance_halflife must be positive"
         assert specific_halflife > 0.0, "risk_model: specific_halflife must be positive"
+        assert (
+            factor_vol_halflife >= 0.0
+        ), "risk_model: factor_vol_halflife must be non-negative"
 
         self.universe_size = universe_size
         self.target_offset = target_offset
         self.min_periods = min_periods
         self.covariance_halflife = covariance_halflife
         self.specific_halflife = specific_halflife
+        # 0 = off: the factor covariance is the plain slow EWMA, as before.
+        self.factor_vol_halflife = factor_vol_halflife
 
     def init(self, inputs: Inputs) -> State:
         sample_signal, features, target, rebalance_signal, universe = inputs
@@ -195,6 +241,11 @@ class RiskModel:
                 k=k,
                 outer_lambda=np.exp2(-1.0 / self.covariance_halflife),
                 res_lambda=np.exp2(-1.0 / self.specific_halflife),
+                vol_lambda=(
+                    np.exp2(-1.0 / self.factor_vol_halflife)
+                    if self.factor_vol_halflife > 0.0
+                    else 0.0
+                ),
             ),
             out_exposures=np.zeros((n, k)),
             out_covariance=np.zeros((k, k)),

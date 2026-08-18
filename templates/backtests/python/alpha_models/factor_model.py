@@ -117,6 +117,10 @@ class AlphaModelState:
     target_offset: int
     min_periods: int
 
+    # Optional column subset of the feature panel (indices into the panel's
+    # column axis); `None` keeps every column.
+    keep: np.ndarray | None
+
     # The last `target_offset + 1` feature cross-sections — just enough to
     # pair the oldest with the target that has now landed.
     pending: deque[np.ndarray]
@@ -138,6 +142,7 @@ class AlphaModel:
         min_periods: int,
         ridge_l2: float,
         premium_halflife: float,
+        keep: list[int] | None = None,
     ) -> None:
         assert universe_size > 0, "alpha_model: universe_size must be positive"
         assert target_offset > 0, "alpha_model: target_offset must be positive"
@@ -150,6 +155,7 @@ class AlphaModel:
         self.min_periods = min_periods
         self.ridge_l2 = ridge_l2
         self.premium_halflife = premium_halflife
+        self.keep = None if not keep else np.asarray(keep, dtype=np.intp)
 
     def init(self, inputs: Inputs) -> State:
         sample_signal, features, target, rebalance_signal, universe = inputs
@@ -157,9 +163,14 @@ class AlphaModel:
         assert target.shape == (n,)
         assert universe.shape == (n,)
 
+        if self.keep is not None:
+            assert (0 <= self.keep).all() and (self.keep < k).all()
+            k = len(self.keep)
+
         return AlphaModelState(
             target_offset=self.target_offset,
             min_periods=self.min_periods,
+            keep=self.keep,
             pending=deque(maxlen=self.target_offset + 1),
             count=np.zeros((n,), dtype=np.int32),
             factor_model=FactorModelRegressor(
@@ -181,6 +192,9 @@ class AlphaModel:
         n, k = features.shape
         assert target.shape == (n,)
         assert universe.shape == (n,)
+
+        if state.keep is not None:
+            features = features[:, state.keep]
 
         if sample_signal:
             state.pending.append(features)

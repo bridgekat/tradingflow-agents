@@ -26,6 +26,7 @@ class MeanVarianceSolver:
     mu: cp.Parameter
     rank: cp.Parameter  # any matrix `Z` such that `X F Xᵀ = Z Zᵀ`
     diag: cp.Parameter  # square root of diagonal of `D`
+    prev: cp.Parameter  # previous weights, for the turnover penalty
     problem: cp.Problem
 
     def __init__(
@@ -36,6 +37,7 @@ class MeanVarianceSolver:
         risk_aversion: float,
         long_only: bool,
         full_position: bool,
+        turnover_penalty: float = 0.0,
     ) -> None:
         """Initializes the optimizer for `n` slots and rank-`k` risk factor model."""
 
@@ -47,6 +49,7 @@ class MeanVarianceSolver:
         self.mu = cp.Parameter(n)
         self.rank = cp.Parameter((n, k))
         self.diag = cp.Parameter(n)
+        self.prev = cp.Parameter(n)
 
         constraints: list[cp.Constraint] = []
         constraints.append(
@@ -64,15 +67,20 @@ class MeanVarianceSolver:
             tracking_error = cp.sum_squares(self.rank.T @ active_w) + cp.sum_squares(
                 cp.multiply(self.diag, active_w)
             )
-            objective = cp.Maximize(active_returns - risk_aversion * tracking_error)
+            objective_expr = active_returns - risk_aversion * tracking_error
         else:
             returns = self.mu.T @ self.w
             variance = cp.sum_squares(self.rank.T @ self.w) + cp.sum_squares(
                 cp.multiply(self.diag, self.w)
             )
-            objective = cp.Maximize(returns - risk_aversion * variance)
+            objective_expr = returns - risk_aversion * variance
 
-        self.problem = cp.Problem(objective, constraints)
+        if turnover_penalty > 0.0:
+            objective_expr = objective_expr - turnover_penalty * cp.norm1(
+                self.w - self.prev
+            )
+
+        self.problem = cp.Problem(cp.Maximize(objective_expr), constraints)
 
     def solve(
         self,
@@ -82,6 +90,7 @@ class MeanVarianceSolver:
         exposures: np.ndarray,  # X
         covariance: np.ndarray,  # F
         specific: np.ndarray,  # diagonal of D
+        prev: np.ndarray | None = None,  # previous weights (turnover penalty)
     ) -> np.ndarray | None:
         """Solves the optimization problem and returns the optimal weights."""
 
@@ -91,6 +100,9 @@ class MeanVarianceSolver:
         assert exposures.shape == (self.n, self.k) and np.isfinite(exposures).all()
         assert covariance.shape == (self.k, self.k) and np.isfinite(covariance).all()
         assert specific.shape == (self.n,) and np.isfinite(specific).all()
+        if prev is None:
+            prev = np.zeros((self.n,))
+        assert prev.shape == (self.n,) and np.isfinite(prev).all()
 
         try:
             lam, s = np.linalg.eigh(covariance)  # F = S Λ S⁻¹ = S Λ Sᵀ
@@ -106,6 +118,7 @@ class MeanVarianceSolver:
         self.mu.value = mu
         self.rank.value = rank
         self.diag.value = diag
+        self.prev.value = prev
 
         try:
             self.problem.solve(solver=cp.SCS, warm_start=True)
@@ -137,6 +150,7 @@ class SlottedMeanVarianceSolver:
     global_mask: np.ndarray
     slot_mask: np.ndarray
     indices: np.ndarray
+    max_weight: float
     inner: MeanVarianceSolver
 
     def __init__(
@@ -148,6 +162,8 @@ class SlottedMeanVarianceSolver:
         risk_aversion: float,
         long_only: bool,
         full_position: bool,
+        max_weight: float = 1.0,
+        turnover_penalty: float = 0.0,
     ) -> None:
         """Initializes the wrapped optimizer for `n` assets, `m` slots and
         rank-`k` risk factor model.
@@ -156,6 +172,7 @@ class SlottedMeanVarianceSolver:
         self.global_mask = np.zeros((n,), dtype=bool)
         self.slot_mask = np.zeros((m,), dtype=bool)
         self.indices = np.zeros((0,), dtype=np.intp)
+        self.max_weight = max_weight
         self.inner = MeanVarianceSolver(
             n=m,
             k=k,
@@ -163,6 +180,7 @@ class SlottedMeanVarianceSolver:
             risk_aversion=risk_aversion,
             long_only=long_only,
             full_position=full_position,
+            turnover_penalty=turnover_penalty,
         )
 
     def update_mask(self, new_global_mask: np.ndarray) -> None:
@@ -196,6 +214,7 @@ class SlottedMeanVarianceSolver:
         exposures: np.ndarray,  # X
         covariance: np.ndarray,  # F
         specific: np.ndarray,  # diagonal of D
+        prev: np.ndarray | None = None,  # previous weights (turnover penalty)
     ) -> np.ndarray | None:
         """Solves over the stocks selected by `active` and returns the optimal
         weights on the full axis (zero off `active`), or `None` when there is
@@ -213,7 +232,10 @@ class SlottedMeanVarianceSolver:
             return None  # avoid infeasible problem, e.g. full position with no stocks
 
         self.update_mask(mask)
-        max_ = self.slot_mask.astype(np.float64)
+        # Per-name cap, relaxed towards equal weight when few names are
+        # active so `sum(w) == 1` stays feasible with some slack.
+        cap = max(self.max_weight, min(1.0, 2.0 / count))
+        max_ = self.slot_mask.astype(np.float64) * cap
         bench_ = np.zeros((m,))
         bench_[self.indices] = bench[self.global_mask]
         mu_ = np.zeros((m,))
@@ -222,6 +244,9 @@ class SlottedMeanVarianceSolver:
         exposures_[self.indices] = exposures[self.global_mask]
         specific_ = np.zeros((m,))
         specific_[self.indices] = specific[self.global_mask]
+        prev_ = np.zeros((m,))
+        if prev is not None:
+            prev_[self.indices] = prev[self.global_mask]
 
         weights_ = self.inner.solve(
             max=max_,
@@ -230,6 +255,7 @@ class SlottedMeanVarianceSolver:
             exposures=exposures_,
             covariance=covariance,
             specific=specific_,
+            prev=prev_,
         )
         if weights_ is None:
             return None
@@ -242,12 +268,41 @@ class SlottedMeanVarianceSolver:
 @dataclass(slots=True)
 class PortfolioState:
     solver: SlottedMeanVarianceSolver
-    out_weights: np.ndarray
+    out_weights: np.ndarray  # what the trader receives (possibly vol-scaled)
+    raw_weights: np.ndarray  # the optimizer's own book, the turnover anchor
+    vol_target: float  # annualized ex-ante vol target (0 = off)
+    vol_periods: float  # periods per year for annualizing the risk forecast
 
 
 class Portfolio:
+    """Mean-variance book with a SEPARATE covariance for the vol-target scaler.
+
+    Inputs carry two covariance forecasts over the same exposures `X`:
+
+    - `(covariance, specific)` — used by the optimizer's risk term only.
+    - `(scaler_covariance, scaler_specific)` — used by the `vol_target`
+      scaler only.
+
+    One matrix was doing two jobs that want opposite things. The optimizer
+    wants a slow factor covariance: how orthogonal a feature is to the risk
+    model is a property of `F`, and a fast `F` re-estimates the short-run
+    turnover/volatility block from the last quarter, at which point the risk
+    model prices the very structure an attention alpha tilts on and the
+    optimizer hedges the signal away. The scaler wants a fast covariance: it
+    is a pure volatility forecast, and a 250-day EWMA of a variance spike is
+    still elevated two years later. When the two are wired to the same risk
+    model this reduces exactly to the single-covariance build.
+    """
+
     type Inputs = tuple[
-        np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
     ]
     type Outputs = np.ndarray
     type Context = int
@@ -260,23 +315,50 @@ class Portfolio:
         risk_aversion: float,
         long_only: bool,
         full_position: bool,
+        max_weight: float = 1.0,
+        turnover_penalty: float = 0.0,
+        vol_target: float = 0.0,
+        vol_periods: float = 252.0,
     ) -> None:
         assert universe_size > 0, "portfolio: universe_size must be positive"
         assert risk_aversion > 0.0, "portfolio: risk_aversion must be positive"
+        assert 0.0 < max_weight <= 1.0, "portfolio: max_weight must be in (0, 1]"
+        assert turnover_penalty >= 0.0, "portfolio: turnover_penalty must be >= 0"
+        assert vol_target >= 0.0, "portfolio: vol_target must be >= 0"
 
         self.universe_size = universe_size
         self.benchmark_relative = benchmark_relative
         self.risk_aversion = risk_aversion
         self.long_only = long_only
         self.full_position = full_position
+        self.max_weight = max_weight
+        self.turnover_penalty = turnover_penalty
+        # Annualized ex-ante volatility target: when positive, the solved book
+        # is scaled by `min(1, target / sqrt(w' Sigma w * periods))`, holding
+        # the remainder in cash. The optimizer's own (unscaled) book stays the
+        # turnover-penalty anchor, so the scaling is a downstream linear map
+        # exactly like `--max-gross`.
+        self.vol_target = vol_target
+        self.vol_periods = vol_periods
 
     def init(self, inputs: Inputs) -> State:
-        rebalance_signal, universe, mu, exposures, covariance, specific = inputs
+        (
+            rebalance_signal,
+            universe,
+            mu,
+            exposures,
+            covariance,
+            specific,
+            scaler_covariance,
+            scaler_specific,
+        ) = inputs
         n, k = exposures.shape
         assert universe.shape == (n,)
         assert mu.shape == (n,)
         assert covariance.shape == (k, k)
         assert specific.shape == (n,)
+        assert scaler_covariance.shape == (k, k)
+        assert scaler_specific.shape == (n,)
 
         return PortfolioState(
             solver=SlottedMeanVarianceSolver(
@@ -287,8 +369,13 @@ class Portfolio:
                 risk_aversion=self.risk_aversion,
                 long_only=self.long_only,
                 full_position=self.full_position,
+                max_weight=self.max_weight,
+                turnover_penalty=self.turnover_penalty,
             ),
             out_weights=np.zeros((n,)),
+            raw_weights=np.zeros((n,)),
+            vol_target=self.vol_target,
+            vol_periods=self.vol_periods,
         )
 
     @staticmethod
@@ -297,25 +384,54 @@ class Portfolio:
 
     @staticmethod
     def compute(inputs: Inputs, state: State, _: Context) -> Outputs:
-        rebalance_signal, universe, mu, exposures, covariance, specific = inputs
+        (
+            rebalance_signal,
+            universe,
+            mu,
+            exposures,
+            covariance,
+            specific,
+            scaler_covariance,
+            scaler_specific,
+        ) = inputs
         n, k = exposures.shape
         assert universe.shape == (n,)
         assert mu.shape == (n,)
         assert covariance.shape == (k, k)
         assert specific.shape == (n,)
+        assert scaler_covariance.shape == (k, k)
+        assert scaler_specific.shape == (n,)
 
         if rebalance_signal:
             valid = (
                 np.isfinite(mu)
                 & np.isfinite(exposures).all(axis=1)
                 & np.isfinite(specific)
+                & np.isfinite(scaler_specific)
             )
             mask = valid & (universe > 0.0)
             weights = state.solver.solve(
-                mask, universe, mu, exposures, covariance, specific
+                mask, universe, mu, exposures, covariance, specific,
+                prev=state.raw_weights,
             )
             if weights is not None:
-                state.out_weights = weights
+                state.raw_weights = weights
+                if state.vol_target > 0.0:
+                    # Ex-ante variance of the solved book under the SCALER's
+                    # covariance forecast: w' (X F_s X' + D_s) w. The
+                    # optimizer never sees F_s / D_s, so the book composition
+                    # is set entirely by the slow model and only its size is
+                    # set by the fast one.
+                    xw = exposures[mask].T @ weights[mask]
+                    var = float(
+                        xw @ scaler_covariance @ xw
+                        + np.sum(scaler_specific[mask] * weights[mask] ** 2)
+                    )
+                    vol = np.sqrt(max(var, 0.0) * state.vol_periods)
+                    scale = 1.0 if vol <= 0.0 else min(1.0, state.vol_target / vol)
+                    state.out_weights = weights * scale
+                else:
+                    state.out_weights = weights
 
         return state.out_weights
 

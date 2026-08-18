@@ -149,6 +149,37 @@ struct Args {
     #[arg(long, value_enum, default_value = "factor-model")]
     alpha_model: AlphaModelKind,
 
+    /// Restrict the alpha model to these feature names (comma-separated,
+    /// matched against the alpha panel's schema labels); empty keeps every
+    /// column. The panel itself is unchanged — the model subsets it.
+    #[arg(long, value_delimiter = ',')]
+    alpha_keep: Vec<String>,
+
+    /// Project the alpha panel orthogonally to the risk panel, every day,
+    /// before the alpha model sees it (`screens.neutralize`). The mean
+    /// predictor's premiums are then estimated on residual features and the
+    /// `mu` it emits carries no exposure to the columns of the covariance
+    /// model's `B` — so the optimizer has nothing to hedge and spends the
+    /// whole signal, instead of the part that survives its own risk charge.
+    #[arg(long)]
+    neutralize_alpha: bool,
+
+    /// Cross-section the neutralizing projection runs over: `universe` (the
+    /// tradable top-`k`, i.e. exactly the names the optimizer chooses among,
+    /// which also restricts the alpha model's training set to them) or
+    /// `market` (every name with a complete risk row, leaving the training
+    /// set as wide as the template's).
+    #[arg(long, default_value = "universe")]
+    neutralize_scope: String,
+
+    /// Control arm for `--neutralize-alpha`: apply the cross-section mask but
+    /// skip the projection itself. With `--neutralize-scope universe` this
+    /// restricts the alpha model to the tradable names and changes nothing
+    /// else, which is what separates "the projection helped" from "training
+    /// the premiums on the traded universe helped".
+    #[arg(long)]
+    neutralize_mask_only: bool,
+
     /// Ridge regression regularization term for the alpha model.
     #[arg(long, default_value_t = 1.0)]
     ridge_l2: f64,
@@ -174,6 +205,26 @@ struct Args {
     #[arg(long, default_value_t = 500)]
     risk_window: usize,
 
+    /// The shrinkage target of the shrinkage risk model: one of `none`,
+    /// `diagonal`, `constant-correlation`, `common-covariance`,
+    /// `single-index`. Unused by the factor model.
+    #[arg(long, default_value = "none")]
+    risk_shrinkage_target: String,
+
+    /// Drop the fully-invested constraint: the optimizer may hold cash, so
+    /// high risk aversion scales gross exposure (and realized volatility)
+    /// down instead of flooring at the long-only minimum-variance book.
+    #[arg(long)]
+    allow_cash: bool,
+
+    /// Cap on the book's gross exposure: weights whose absolute sum exceeds
+    /// this are scaled down to it, the remainder held as cash. `1.0` (the
+    /// default) reproduces the plain no-leverage book; smaller values
+    /// vol-target the optimized book towards cash while preserving its
+    /// composition (and, unlike `--allow-cash`, its market exposure share).
+    #[arg(long, default_value_t = 1.0)]
+    max_gross: f64,
+
     /// Halflife (in number of trading days) of the exponential decay for
     /// the factor covariances in the risk model.
     #[arg(long, default_value_t = 250.0)]
@@ -183,6 +234,42 @@ struct Args {
     /// the specific variances in the risk model.
     #[arg(long, default_value_t = 150.0)]
     specific_halflife: f64,
+
+    /// Halflife (in trading days) of a SECOND exponential decay used only for
+    /// the factor VARIANCES; the factor correlations keep
+    /// `--covariance-halflife`. `0` (the default) is off and reproduces the
+    /// plain single-halflife factor covariance. A `k x k` correlation matrix
+    /// needs far more data than `k` variances, so this lets the level track a
+    /// volatility regime without the correlations being estimated on 60 days.
+    /// (r4-validate's lever, copied verbatim from `runs/r4-validate/`.)
+    #[arg(long, default_value_t = 0.0)]
+    factor_vol_halflife: f64,
+
+    /// `--factor-vol-halflife` for the scaler's risk model. `0` copies
+    /// `--factor-vol-halflife`; use `-1` to force it off in the scaler alone.
+    #[arg(long, default_value_t = 0.0)]
+    scaler_factor_vol_halflife: f64,
+
+    /// Halflife of the factor covariances in the SECOND risk model, the one
+    /// used only by the `--vol-target` scaler. `0` (the default) copies
+    /// `--covariance-halflife`, which makes the second model an exact clone
+    /// of the first and the whole build a no-op.
+    ///
+    /// The two jobs a covariance does here want opposite things. The
+    /// optimizer's risk term wants a SLOW factor covariance: a feature's
+    /// orthogonality to the risk model is a property of `F`, and a fast `F`
+    /// re-estimates the short-run turnover/volatility block from the last
+    /// quarter, so the risk model starts pricing the structure an attention
+    /// alpha tilts on and the optimizer hedges the signal away. The vol-target
+    /// scaler wants a FAST covariance: it is a pure volatility forecast, and a
+    /// 250-day EWMA of a variance spike is stale for years afterwards.
+    #[arg(long, default_value_t = 0.0)]
+    scaler_covariance_halflife: f64,
+
+    /// Halflife of the specific variances in the scaler's risk model. `0`
+    /// (the default) copies `--specific-halflife`.
+    #[arg(long, default_value_t = 0.0)]
+    scaler_specific_halflife: f64,
 
     /// The portfolio optimizer.
     #[arg(long, value_enum, default_value = "mean-variance")]
@@ -197,6 +284,28 @@ struct Args {
     /// `expected returns - risk aversion * variance of returns`.
     #[arg(long, value_delimiter = ',', default_value = "0.5,1,2,5,10,25,50,100")]
     risk_aversion: Vec<f64>,
+
+    /// Maximum weight per name in the optimizer (1.0 = uncapped, the
+    /// template default).
+    #[arg(long, default_value_t = 1.0)]
+    max_weight: f64,
+
+    /// L1 turnover penalty coefficient in the optimizer objective:
+    /// subtracts `penalty * ||w - w_prev||_1` (0 = off, the template
+    /// default). Units are per-rebalance expected return, like `mu`.
+    #[arg(long, default_value_t = 0.0)]
+    turnover_penalty: f64,
+
+    /// Annualized ex-ante volatility target (0 = off, the default). When
+    /// positive, the optimizer's book is scaled by
+    /// `min(1, target / sqrt(w' Σ w × 252))` using the risk model's own
+    /// covariance forecast, with the remainder held as cash. Unlike
+    /// `--max-gross` the scale is time-varying, so exposure falls in
+    /// forecast-high-volatility regimes. The unscaled book remains the
+    /// turnover penalty's anchor, so the two compose as they do for
+    /// `--max-gross`.
+    #[arg(long, default_value_t = 0.0)]
+    vol_target: f64,
 
     /// Initial cash.
     #[arg(long, default_value_t = 1_000_000.0)]
@@ -268,6 +377,31 @@ impl Args {
             RiskModelKind::FactorModel => "risk_models.factor_model",
             RiskModelKind::Shrinkage => "risk_models.shrinkage",
         }
+    }
+
+    /// Halflives of the scaler's risk model: the `--scaler-*` overrides when
+    /// positive, otherwise the optimizer's own. Third element is the scaler's
+    /// factor-variance halflife (negative means "off in the scaler only").
+    pub fn scaler_halflives(&self) -> (f64, f64, f64) {
+        (
+            if self.scaler_covariance_halflife > 0.0 {
+                self.scaler_covariance_halflife
+            } else {
+                self.covariance_halflife
+            },
+            if self.scaler_specific_halflife > 0.0 {
+                self.scaler_specific_halflife
+            } else {
+                self.specific_halflife
+            },
+            if self.scaler_factor_vol_halflife < 0.0 {
+                0.0
+            } else if self.scaler_factor_vol_halflife > 0.0 {
+                self.scaler_factor_vol_halflife
+            } else {
+                self.factor_vol_halflife
+            },
+        )
     }
 
     /// The trader configuration, shared by the index baseline and every
@@ -366,6 +500,26 @@ async fn main() {
 
     let alpha_labels = alpha_features.schema.labels();
     let risk_labels = risk_features.schema.labels();
+
+    // Map `--alpha-keep` names to alpha panel column indices.
+    let alpha_keep: Vec<usize> = args
+        .alpha_keep
+        .iter()
+        .map(|name| {
+            alpha_labels
+                .iter()
+                .position(|l| l == name)
+                .unwrap_or_else(|| panic!("--alpha-keep: unknown feature {name:?}"))
+        })
+        .collect();
+    if !alpha_keep.is_empty() {
+        println!(
+            "alpha keep: {} of {} columns",
+            alpha_keep.len(),
+            alpha_labels.len()
+        );
+    }
+
     println!("alpha features: {}", alpha_labels.join(", "));
     println!("risk features: {}", risk_labels.join(", "));
     println!("alpha model: {}", args.alpha_module());
@@ -396,6 +550,38 @@ async fn main() {
     let returns = b.op(rolling::pct_change(1), (daily, m.adj_close));
     let returns_demeaned = b.op(stats::demean(), returns);
 
+    // Optionally neutralize the alpha panel against the risk panel: one
+    // cross-sectional projection per trading day, upstream of the mean
+    // predictor. See `--neutralize-alpha`.
+    type NeutralizeInputs = (
+        SignalPort<0>,     // sample (trading day) signal
+        ArrayPort<f64, 2>, // alpha features
+        ArrayPort<f64, 2>, // risk features (the exposure matrix B)
+        ArrayPort<f64, 1>, // universe weights (positive means in-universe)
+    );
+    type NeutralizeOutputs = ArrayPort<f64, 2>; // residual alpha features
+    let alpha_panel = match args.neutralize_alpha {
+        false => alpha_features.panel,
+        true => {
+            println!(
+                "alpha neutralization: on, scope {}, project {}",
+                args.neutralize_scope, !args.neutralize_mask_only
+            );
+            let scope = args.neutralize_scope.clone();
+            let project = !args.neutralize_mask_only;
+            b.op(
+                py_operator_module::<NeutralizeInputs, NeutralizeOutputs>(
+                    "screens.neutralize",
+                    py_params(move |d| {
+                        d.set_item("scope", scope.as_str())?;
+                        d.set_item("project", project)
+                    }),
+                ),
+                (daily, alpha_features.panel, risk_features.panel, universe),
+            )
+        }
+    };
+
     // The mean predictor (alpha model).
     //
     // Prediction is updated per rebalance signal, while observing one sample
@@ -417,16 +603,11 @@ async fn main() {
                 d.set_item("min_periods", args.min_periods)?;
                 d.set_item("ridge_l2", args.ridge_l2)?;
                 d.set_item("premium_halflife", args.premium_halflife)?;
+                d.set_item("keep", alpha_keep.clone())?;
                 Ok(())
             }),
         ),
-        (
-            daily,
-            alpha_features.panel,
-            returns_demeaned,
-            rebalance,
-            universe,
-        ),
+        (daily, alpha_panel, returns_demeaned, rebalance, universe),
     );
 
     // The covariance predictor (risk model).
@@ -455,9 +636,52 @@ async fn main() {
                 d.set_item("min_periods", args.min_periods)?;
                 d.set_item("covariance_halflife", args.covariance_halflife)?;
                 d.set_item("specific_halflife", args.specific_halflife)?;
+                if args.risk_model == RiskModelKind::FactorModel {
+                    d.set_item("factor_vol_halflife", args.factor_vol_halflife)?;
+                }
                 if args.risk_model == RiskModelKind::Shrinkage {
                     d.set_item("rank", args.risk_rank)?;
                     d.set_item("window", args.risk_window)?;
+                    d.set_item("target", args.risk_shrinkage_target.as_str())?;
+                }
+                Ok(())
+            }),
+        ),
+        (daily, risk_features.panel, returns, rebalance, universe),
+    );
+
+    // The SECOND risk model: same node type, same inputs, different decay
+    // rates. Its exposures are bit-identical to the first node's (the
+    // exposures port is the risk feature panel passed through, and both nodes
+    // latch on the same rebalance signal), so only its `F` and `D` are wired
+    // onward — to the vol-target scaler, never to the optimizer's risk term.
+    let (scaler_covariance_halflife, scaler_specific_halflife, scaler_factor_vol_halflife) =
+        args.scaler_halflives();
+    println!(
+        "risk model halflives: optimizer cov {} / spec {} / fvol {}, scaler cov {} / spec {} / fvol {}",
+        args.covariance_halflife,
+        args.specific_halflife,
+        args.factor_vol_halflife,
+        scaler_covariance_halflife,
+        scaler_specific_halflife,
+        scaler_factor_vol_halflife,
+    );
+    let (_scaler_exposures, scaler_covariance, scaler_specific) = b.op(
+        py_operator_module::<RiskInputs, RiskOutputs>(
+            args.risk_module(),
+            py_params(|d| {
+                d.set_item("universe_size", k)?;
+                d.set_item("target_offset", 1)?;
+                d.set_item("min_periods", args.min_periods)?;
+                d.set_item("covariance_halflife", scaler_covariance_halflife)?;
+                d.set_item("specific_halflife", scaler_specific_halflife)?;
+                if args.risk_model == RiskModelKind::FactorModel {
+                    d.set_item("factor_vol_halflife", scaler_factor_vol_halflife)?;
+                }
+                if args.risk_model == RiskModelKind::Shrinkage {
+                    d.set_item("rank", args.risk_rank)?;
+                    d.set_item("window", args.risk_window)?;
+                    d.set_item("target", args.risk_shrinkage_target.as_str())?;
                 }
                 Ok(())
             }),
@@ -474,8 +698,10 @@ async fn main() {
             ArrayPort<f64, 1>, // index weights
             ArrayPort<f64, 1>, // predicted returns (demeaned)
             ArrayPort<f64, 2>, // risk factor exposures: X
-            ArrayPort<f64, 2>, // factor covariance matrix: F
-            ArrayPort<f64, 1>, // specific variances: diagonal D
+            ArrayPort<f64, 2>, // factor covariance matrix: F  (optimizer)
+            ArrayPort<f64, 1>, // specific variances: diagonal D  (optimizer)
+            ArrayPort<f64, 2>, // factor covariance matrix: F  (vol scaler)
+            ArrayPort<f64, 1>, // specific variances: diagonal D  (vol scaler)
         );
         type PortfolioOutputs = ArrayPort<f64, 1>; // portfolio weights
         let weights = b.op(
@@ -486,16 +712,28 @@ async fn main() {
                     d.set_item("benchmark_relative", args.benchmark_relative)?;
                     d.set_item("risk_aversion", risk_aversion)?;
                     d.set_item("long_only", true)?; // aim for long-only portfolios
-                    d.set_item("full_position", true)?; // aim for fully invested portfolios
+                    d.set_item("full_position", !args.allow_cash)?; // fully invested unless cash is allowed
+                    d.set_item("max_weight", args.max_weight)?;
+                    d.set_item("turnover_penalty", args.turnover_penalty)?;
+                    d.set_item("vol_target", args.vol_target)?;
                     Ok(())
                 }),
             ),
-            (rebalance, universe, mu, exposures, covariance, specific),
+            (
+                rebalance,
+                universe,
+                mu,
+                exposures,
+                covariance,
+                specific,
+                scaler_covariance,
+                scaler_specific,
+            ),
         );
 
         // Limit weights to long-only and non-leveraged.
         let weights = b.op(
-            elem::clampf(0.0, f64::INFINITY).then(stats::scale_down(1.0)),
+            elem::clampf(0.0, f64::INFINITY).then(stats::scale_down(args.max_gross)),
             weights,
         );
 
